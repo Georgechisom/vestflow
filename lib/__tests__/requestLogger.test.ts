@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { withLogging, logRequest, RequestLogEntry } from "../requestLogger";
+import { withLogging, logRequest, RequestLogEntry, RESPONSE_TIME_HEADER } from "../requestLogger";
 
 function createMockRequest(pathname: string, method = "GET", headers?: Record<string, string>) {
   const url = new URL(`http://localhost${pathname}`);
@@ -13,7 +13,15 @@ function createMockRequest(pathname: string, method = "GET", headers?: Record<st
 }
 
 function createMockResponse(status = 200) {
-  return { status } as any;
+  const headersMap = new Map<string, string>();
+  return {
+    status,
+    headers: {
+      set: (name: string, value: string) => headersMap.set(name, value),
+      get: (name: string) => headersMap.get(name) ?? null,
+      _map: headersMap,
+    },
+  } as any;
 }
 
 describe("requestLogger", () => {
@@ -183,6 +191,95 @@ describe("requestLogger", () => {
       expect(consoleSpy).toHaveBeenCalledTimes(1);
       const output = JSON.parse(consoleSpy.mock.calls[0][0]);
       expect(output).toEqual(entry);
+    });
+  });
+
+  // ── #1075: X-Response-Time header ─────────────────────────────────────────
+
+  describe("X-Response-Time header (#1075)", () => {
+    it("sets X-Response-Time on the response", async () => {
+      const mockRequest = createMockRequest("/api/schedules", "GET", {
+        "x-request-id": "rt-test",
+        "x-request-start": String(Date.now()),
+      });
+      const mockResponse = createMockResponse(200);
+      const wrapped = withLogging(vi.fn().mockResolvedValue(mockResponse));
+
+      const result = await wrapped(mockRequest);
+
+      const headerValue = result.headers.get(RESPONSE_TIME_HEADER);
+      expect(headerValue).toBeTruthy();
+      expect(headerValue).toMatch(/^\d+ms$/);
+    });
+
+    it("X-Response-Time value is a non-negative integer followed by 'ms'", async () => {
+      const pastMs = Date.now() - 50;
+      const mockRequest = createMockRequest("/api/events", "GET", {
+        "x-request-start": String(pastMs),
+      });
+      const wrapped = withLogging(vi.fn().mockResolvedValue(createMockResponse(200)));
+
+      const result = await wrapped(mockRequest);
+
+      const raw = result.headers.get(RESPONSE_TIME_HEADER)!;
+      const ms = parseInt(raw, 10);
+      expect(Number.isInteger(ms)).toBe(true);
+      expect(ms).toBeGreaterThanOrEqual(0);
+    });
+
+    it("header is present even on error-status responses", async () => {
+      const mockRequest = createMockRequest("/api/missing", "GET", {
+        "x-request-start": String(Date.now()),
+      });
+      const wrapped = withLogging(vi.fn().mockResolvedValue(createMockResponse(404)));
+
+      const result = await wrapped(mockRequest);
+      expect(result.headers.get(RESPONSE_TIME_HEADER)).toMatch(/^\d+ms$/);
+    });
+  });
+
+  // ── #1072: account field in log lines ─────────────────────────────────────
+
+  describe("account correlation field (#1072)", () => {
+    it("includes account in log when account query param is present", async () => {
+      const addr = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+      const mockRequest = createMockRequest(
+        `/api/streams?account=${addr}`,
+        "GET",
+        { "x-request-id": "acct-test" },
+      );
+      const wrapped = withLogging(vi.fn().mockResolvedValue(createMockResponse(200)));
+
+      await wrapped(mockRequest);
+
+      const logged: RequestLogEntry = JSON.parse(consoleSpy.mock.calls[0][0]);
+      expect(logged.account).toBe(addr);
+    });
+
+    it("omits account field when query param is absent", async () => {
+      const mockRequest = createMockRequest("/api/events", "GET", {
+        "x-request-id": "no-acct",
+      });
+      const wrapped = withLogging(vi.fn().mockResolvedValue(createMockResponse(200)));
+
+      await wrapped(mockRequest);
+
+      const logged: RequestLogEntry = JSON.parse(consoleSpy.mock.calls[0][0]);
+      expect(logged).not.toHaveProperty("account");
+    });
+
+    it("does not include auth token or other sensitive headers in log", async () => {
+      const mockRequest = createMockRequest("/api/streams", "GET", {
+        "authorization": "Bearer super-secret-token",
+        "x-wallet-address": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+      });
+      const wrapped = withLogging(vi.fn().mockResolvedValue(createMockResponse(200)));
+
+      await wrapped(mockRequest);
+
+      const logOutput = consoleSpy.mock.calls[0][0];
+      expect(logOutput).not.toContain("super-secret-token");
+      expect(logOutput).not.toContain("authorization");
     });
   });
 });

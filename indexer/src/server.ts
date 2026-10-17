@@ -63,6 +63,7 @@ import {
   recordHttpRequest,
   renderPrometheusMetrics,
 } from "./metrics";
+import { warmAnalyticsCache } from "./cache-warm";
 
 const PORT = Number(process.env.INDEXER_PORT ?? "3001");
 
@@ -1183,4 +1184,5 @@ if (typeof require !== "undefined" && require.main === module) {
   });
 
   startNotificationFanout();
+  warmAnalyticsCache();
 }
