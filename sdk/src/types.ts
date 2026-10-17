@@ -407,6 +407,58 @@ export class ProfileError extends Error {
   }
 }
 
+/** Supported rate display periods for formatRate (#1090). */
+export type RatePeriod = "second" | "day" | "month" | "year";
+
+/**
+ * Protocol overview totals returned by `VestflowClient.getAnalyticsTotals` (#1091).
+ *
+ * All amounts are in base units (stroops) as strings to prevent precision loss.
+ */
+export interface ProtocolTotals {
+  /** Total tokens deposited across all created schedules, in stroops. */
+  total_created: string;
+  /** Total tokens claimed by beneficiaries to date, in stroops. */
+  total_claimed: string;
+  /** Total unvested tokens returned to grantors upon schedule revocations, in stroops. */
+  total_revoked_unvested: string;
+  /** Total current value locked in active schedules, in stroops. */
+  total_value_locked: string;
+  /** Total number of currently active vesting schedules. */
+  active_schedules: number;
+}
+
+/**
+ * An individual activity event for a wallet returned by
+ * `VestflowClient.getRecentActivity` (#1089).
+ */
+export interface ActivityEvent {
+  /** Event action type (e.g. "given", "collected", "schedule_created", "claimed"). */
+  type: string;
+  /** Counterparty address in the transaction. */
+  counterparty: string;
+  /** Stellar Asset Contract or token identifier. */
+  token: string;
+  /** Transacted token amount in stroops as a string. */
+  amount: string;
+  /** Unix timestamp in seconds when the event was recorded. */
+  timestamp: number;
+}
+
+/**
+ * Options for querying recent activity for an address (#1089).
+ */
+export interface RecentActivityOptions {
+  /** Maximum number of activity events to return. */
+  limit?: number;
+  /** Number of events to skip for offset-based pagination. */
+  offset?: number;
+  /** Pagination cursor for cursor-based pagination. */
+  cursor?: string;
+  /** Optional token address filter. */
+  token?: string;
+}
+
 /**
  * Parameters for creating a new vesting schedule.
  */

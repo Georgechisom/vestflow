@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { isStellarAddress } from "../src/utils";
 
-describe("isStellarAddress (#1107)", () => {
+describe("isStellarAddress (#1088, #1107)", () => {
   it("returns true for a valid Stellar public key address", () => {
     const valid = "GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ";
     expect(isStellarAddress(valid)).toBe(true);
@@ -33,5 +33,12 @@ describe("isStellarAddress (#1107)", () => {
     // Mutate the checksum while keeping length and valid base32 characters
     const badChecksum = "GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGA";
     expect(isStellarAddress(badChecksum)).toBe(false);
+  });
+
+  it("returns false for non-string inputs", () => {
+    expect(isStellarAddress(null)).toBe(false);
+    expect(isStellarAddress(undefined)).toBe(false);
+    expect(isStellarAddress(12345)).toBe(false);
+    expect(isStellarAddress({})).toBe(false);
   });
 });

@@ -56,6 +56,10 @@ export type {
   DripsListMember,
   PaginationOptions,
   SupportedToken,
+  ProtocolTotals,
+  ActivityEvent,
+  RecentActivityOptions,
+  RatePeriod,
 } from "./types";
 export { waitForTransaction, TimeoutError } from "./waitForTransaction";
 export type {

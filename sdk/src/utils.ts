@@ -7,7 +7,7 @@
 // ===========================================================================
 
 import { StrKey } from "@stellar/stellar-sdk";
-import type { ScheduleData } from "./types";
+import type { ScheduleData, RatePeriod } from "./types";
 
 /** Numeric error codes emitted by the VestFlow contract. */
 export enum DripsErrorCode {
@@ -244,18 +244,105 @@ function formatUnits(value: bigint, decimals: number, maxFractionDigits: number)
  * @param token - Token label to display (e.g. "XLM").
  * @param decimals - Number of base-unit decimals for the token (e.g. 7 for XLM stroops).
  */
-export function formatRate(amtPerSec: bigint, token: string, decimals: number): string {
-  if (amtPerSec < 0n) throw new Error("amtPerSec must not be negative");
+// Multipliers in seconds for explicitly requested rate periods (#1090).
+const PERIOD_MULTIPLIERS: Record<string, bigint> = {
+  second: 1n,
+  sec: 1n,
+  day: 86_400n,
+  month: 2_592_000n, // 30-day month (30 * 86_400n)
+  year: 31_536_000n, // 365-day year (365 * 86_400n)
+};
+
+const VALID_PERIODS = new Set(["second", "sec", "day", "month", "year"]);
+
+/**
+ * Format a per-second flow rate into a human-readable string.
+ *
+ * Supports two modes:
+ * 1. Explicit period mode (#1090): e.g. `formatRate(ratePerSec, 'day')` → "0.1 XLM/day".
+ *    Accepts `period: 'second' | 'day' | 'month' | 'year'`.
+ *    Uses precise multipliers (1 for second, 86400 for day, 2592000 for 30-day month, 31536000 for 365-day year).
+ * 2. Automatic scaling mode (#683): e.g. `formatRate(amtPerSec, 'XLM', 7)` → "0.001157 XLM / sec".
+ *    Picks the smallest unit (sec → min → hour → day) whose value doesn't truncate to zero.
+ *
+ * Uses BigInt arithmetic throughout — no floating-point.
+ *
+ * @param amtPerSec - Flow rate in base units per second (e.g. stroops/sec).
+ * @param period - Target display period ('second' | 'day' | 'month' | 'year').
+ * @param token - Token label to display (defaults to "XLM").
+ * @param decimals - Token decimals (defaults to 7 for XLM).
+ */
+export function formatRate(
+  amtPerSec: bigint | number | string,
+  period: RatePeriod,
+  token?: string,
+  decimals?: number
+): string;
+export function formatRate(
+  amtPerSec: bigint | number | string,
+  token: string,
+  decimals: number,
+  period?: RatePeriod
+): string;
+export function formatRate(
+  amtPerSec: bigint | number | string,
+  arg2?: string | RatePeriod,
+  arg3?: number | string,
+  arg4?: number | RatePeriod
+): string {
+  const raw = BigInt(amtPerSec);
+  if (raw < 0n) throw new Error("amtPerSec must not be negative");
+
+  let period: string | undefined;
+  let token: string = "XLM";
+  let decimals: number = 7;
+
+  if (typeof arg2 === "string" && VALID_PERIODS.has(arg2.toLowerCase())) {
+    period = arg2.toLowerCase();
+    if (typeof arg3 === "string") {
+      token = arg3;
+    }
+    if (typeof arg4 === "number") {
+      decimals = arg4;
+    }
+  } else if (typeof arg2 === "string" && typeof arg3 === "number") {
+    token = arg2;
+    decimals = arg3;
+    if (typeof arg4 === "string") {
+      if (VALID_PERIODS.has(arg4.toLowerCase())) {
+        period = arg4.toLowerCase();
+      } else {
+        throw new Error(
+          `Invalid period: ${String(arg4)}. Expected 'second', 'day', 'month', or 'year'.`
+        );
+      }
+    }
+  } else if (arg2 !== undefined) {
+    throw new Error(
+      `Invalid argument: ${String(arg2)}. Expected a valid period or token symbol.`
+    );
+  }
+
   if (!Number.isInteger(decimals) || decimals < 0) {
     throw new Error("decimals must be a non-negative integer");
   }
 
+  // Explicit period mode (#1090)
+  if (period !== undefined) {
+    const multiplier = PERIOD_MULTIPLIERS[period];
+    const perUnit = raw * multiplier;
+    const maxFractionDigits = Math.min(decimals, 6);
+    const formatted = formatUnits(perUnit, decimals, maxFractionDigits);
+    return `${formatted} ${token}/${period}`;
+  }
+
+  // Automatic scaling mode (#683)
   const maxFractionDigits = Math.min(decimals, 6);
   const last = RATE_UNITS.length - 1;
 
   for (let i = 0; i < RATE_UNITS.length; i++) {
     const unit = RATE_UNITS[i];
-    const perUnit = amtPerSec * unit.seconds;
+    const perUnit = raw * unit.seconds;
     const formatted = formatUnits(perUnit, decimals, maxFractionDigits);
     if (formatted !== "0" || i === last) {
       return `${formatted} ${token} / ${unit.label}`;
@@ -366,15 +453,24 @@ export function formatSchedule(
 // ---------------------------------------------------------------------------
 
 /**
- * Validate whether a string is a valid Stellar public key (G... address).
+ * Validate whether a string is a valid Stellar public key (G... address) (#1088).
  *
- * Uses StrKey.isValidEd25519PublicKey without making any network calls.
+ * Validates that the input:
+ * 1. Is a string.
+ * 2. Has the 'G' account ID prefix.
+ * 3. Is exactly 56 characters long.
+ * 4. Is encoded with valid RFC4648 Base32 alphabet.
+ * 5. Contains a valid 16-bit CRC checksum matching the public key payload.
+ *
+ * Pure function: performs no network calls, runs in O(1) time and space.
  *
  * @param address - Address string to validate
  * @returns true if valid Stellar public key, false otherwise
  */
 export function isStellarAddress(address: unknown): boolean {
-  if (typeof address !== "string") return false;
+  if (typeof address !== "string" || address.length !== 56 || address[0] !== "G") {
+    return false;
+  }
   return StrKey.isValidEd25519PublicKey(address);
 }
 

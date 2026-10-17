@@ -47,9 +47,12 @@ import type {
   DripsListMember,
   PaginationOptions,
   SupportedToken,
+  ProtocolTotals,
+  ActivityEvent,
+  RecentActivityOptions,
 } from "./types";
 import { ProfileError } from "./types";
-import { xlmToStroops } from "./utils";
+import { xlmToStroops, isStellarAddress } from "./utils";
 import {
   waitForTransaction as waitForTransactionHelper,
   TimeoutError,
@@ -1144,6 +1147,114 @@ export class VestflowClient {
         dripsLists: dripsLists.length,
       },
     };
+  }
+
+  /**
+   * Fetch protocol overview totals from the indexer's
+   * `/analytics/protocol/totals` endpoint (#1091).
+   *
+   * Queries the aggregated protocol metrics: total deposited/created tokens,
+   * total claimed tokens, total unvested revoked tokens, total value locked
+   * across active schedules, and count of active schedules.
+   *
+   * @returns Typed `ProtocolTotals` object.
+   * @throws If the indexer request fails with an HTTP error.
+   */
+  async getAnalyticsTotals(): Promise<ProtocolTotals> {
+    const url = new URL("/analytics/protocol/totals", this.indexerUrl);
+    url.searchParams.set("network", this.network);
+
+    const res = await fetch(url.toString());
+    if (res.status === 404) {
+      return {
+        total_created: "0",
+        total_claimed: "0",
+        total_revoked_unvested: "0",
+        total_value_locked: "0",
+        active_schedules: 0,
+      };
+    }
+    if (!res.ok) {
+      throw new Error(`Failed to fetch protocol totals: ${res.status}`);
+    }
+
+    const data = await res.json();
+    return {
+      total_created: String(data?.total_created ?? "0"),
+      total_claimed: String(data?.total_claimed ?? "0"),
+      total_revoked_unvested: String(data?.total_revoked_unvested ?? "0"),
+      total_value_locked: String(data?.total_value_locked ?? "0"),
+      active_schedules: Number(data?.active_schedules ?? 0),
+    };
+  }
+
+  /**
+   * Fetch recent activity events for a given account from the indexer's
+   * `/profile/:address/recent-activity` endpoint (#1089).
+   *
+   * @param address - Stellar public key (G... address) to look up.
+   * @param options - Optional pagination and filtering options (limit, offset, cursor, token).
+   * @returns Typed list of `ActivityEvent` objects. Returns an empty array for new/inactive wallets.
+   * @throws If the address is invalid or if the request fails with a non-404 error.
+   */
+  async getRecentActivity(
+    address: string,
+    options: RecentActivityOptions = {}
+  ): Promise<ActivityEvent[]> {
+    if (!isStellarAddress(address)) {
+      throw new TypeError(`Invalid Stellar address for recent activity: ${String(address)}`);
+    }
+
+    const url = new URL(
+      `/profile/${encodeURIComponent(address)}/recent-activity`,
+      this.indexerUrl
+    );
+    url.searchParams.set("network", this.network);
+
+    if (options.limit !== undefined) {
+      url.searchParams.set("limit", String(options.limit));
+    }
+    if (options.offset !== undefined) {
+      url.searchParams.set("offset", String(options.offset));
+    }
+    if (options.cursor !== undefined) {
+      url.searchParams.set("cursor", String(options.cursor));
+    }
+    if (options.token !== undefined) {
+      url.searchParams.set("token", String(options.token));
+    }
+
+    const res = await fetch(url.toString());
+    if (res.status === 404) {
+      return [];
+    }
+    if (!res.ok) {
+      throw new Error(
+        `Failed to fetch recent activity for ${address}: ${res.status}`
+      );
+    }
+
+    const data = await res.json();
+    const rawEvents: any[] = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.events)
+        ? data.events
+        : Array.isArray(data?.activity)
+          ? data.activity
+          : [];
+
+    return rawEvents.map((e: any) => ({
+      type: String(e.type ?? e.event_type ?? ""),
+      counterparty: String(e.counterparty ?? e.beneficiary ?? e.grantor ?? ""),
+      token: String(e.token ?? ""),
+      amount: String(e.amount ?? e.amount_stroops ?? "0"),
+      timestamp: Number(
+        e.timestamp ??
+          (e.ledger_closed_at
+            ? Math.floor(new Date(e.ledger_closed_at).getTime() / 1000)
+            : 0)
+      ),
+    }));
   }
 
   /**
