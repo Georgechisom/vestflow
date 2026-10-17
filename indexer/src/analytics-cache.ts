@@ -35,19 +35,29 @@ export function cacheGet<T>(key: string): T | undefined {
   return entry.value as T;
 }
 
-export function cacheSet<T>(key: string, value: T, to: string): void {
+export function cacheSet<T>(
+  key: string,
+  value: T,
+  to: string,
+  ttlMs: number = TTL_MS,
+): void {
   if (store.size >= MAX_ENTRIES && !store.has(key)) {
     const oldestKey = store.keys().next().value;
     if (oldestKey !== undefined) store.delete(oldestKey);
   }
-  store.set(key, { value, expiresAt: Date.now() + TTL_MS, to });
+  store.set(key, { value, expiresAt: Date.now() + ttlMs, to });
 }
 
 /** Drop every cached range that includes today — called after each new ledger is indexed. */
 export function invalidateToday(): void {
   const today = new Date().toISOString().slice(0, 10);
   for (const [key, entry] of store) {
-    if (entry.to >= today) store.delete(key);
+    // `to` is an ISO date for date-ranged analytics. Entries keyed with a
+    // non-date marker (e.g. the rolling stream-volume window) opt out of
+    // per-ledger invalidation and expire on their own TTL instead.
+    if (/^\d{4}-\d{2}-\d{2}$/.test(entry.to) && entry.to >= today) {
+      store.delete(key);
+    }
   }
 }
 

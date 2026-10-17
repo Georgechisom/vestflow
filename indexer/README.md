@@ -131,8 +131,13 @@ no history exists.
 
 ### `GET /health`
 
+Liveness plus indexer lag. `indexer_lag_seconds` is how many seconds the
+indexer is behind the chain tip (ledger lag × the ~5s ledger close interval).
+When it exceeds 60 seconds the probe reports `status: "degraded"` and answers
+`503`; otherwise `status: "healthy"` and `200`.
+
 ```json
-{ "ok": true, "network": "testnet", "checkpoint": 5678901 }
+{ "ok": true, "status": "healthy", "network": "testnet", "checkpoint": 5678901, "indexer_lag_seconds": 0 }
 ```
 
 ### `GET /events`
@@ -257,6 +262,53 @@ Query params: `from`, `to` (default: last 30 days).
 `{ total_schedules_created, total_distributed, active_schedules,
 revoked_schedules, avg_duration_days }` for every schedule the address has
 created.
+
+### `GET /analytics/stream-volume`
+
+Total volume streamed for a token over the trailing 7 and 30 day windows,
+plus the number of streams that settled in each window. Query params: `token`
+(required, asset contract address), `network` (`testnet` | `mainnet`, default
+`testnet`). Responses are cached for 10 minutes (`Cache-Control:
+max-age=600`).
+
+```
+GET /analytics/stream-volume?token=CDLZ...
+```
+
+```json
+{
+  "volume_7d": "1750",
+  "volume_30d": "5750",
+  "stream_count_7d": 2,
+  "stream_count_30d": 3
+}
+```
+
+### `GET /splits/by-receiver/:address`
+
+Every account whose current splits configuration routes to `:address`, one row
+per account. Query params: `limit` (default 50, max 100), `offset` (default 0),
+`network` (`testnet` | `mainnet`, default `testnet`). `weight_bps` is the
+account's weight for the receiver in basis points; `percentage` is
+`weight_bps / 100`. Returns an empty `accounts` array when no account routes to
+the address.
+
+```
+GET /splits/by-receiver/GBRP...?limit=50&offset=0
+```
+
+```json
+{
+  "address": "GBRP...",
+  "accounts": [
+    { "account": "GA7Q...", "weight_bps": 5000, "percentage": 50 }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0,
+  "has_more": false
+}
+```
 
 ---
 

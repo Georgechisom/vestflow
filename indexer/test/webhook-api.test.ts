@@ -19,6 +19,9 @@ process.env.INDEXER_DB_PATH_TESTNET = DB_PATH;
 process.env.WEBHOOK_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
 process.env.WEBHOOK_ALLOW_INSECURE_URLS = "true";
 process.env.JWT_SECRET = "test-jwt-secret";
+// Pin the chain tip so /health reports a deterministic zero lag (healthy)
+// without depending on live RPC availability.
+process.env.INDEXER_LATEST_LEDGER = "0";
 
 const { getDb } = await import("../src/db");
 const store = await import("../src/webhook-store");
