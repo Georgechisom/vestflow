@@ -3428,7 +3428,30 @@ export interface CollectHistoryDay {
   amount_collected: string;
 }
 
-/** Daily collected totals over [from, to], gap-filled with zero rows. */
+const ISO_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const MAX_HISTORY_DAYS = 366;
+
+/** Validates/clamps an untrusted [from, to] day range to at most MAX_HISTORY_DAYS. */
+function clampDayRange(from?: string, to?: string): { fromDay: string; toDay: string } {
+  const defaultTo = new Date().toISOString().slice(0, 10);
+  const defaultFrom = new Date(Date.now() - 30 * 86_400_000).toISOString().slice(0, 10);
+
+  const validTo = to && ISO_DAY_RE.test(to) && !Number.isNaN(Date.parse(to)) ? to : defaultTo;
+  const validFrom = from && ISO_DAY_RE.test(from) && !Number.isNaN(Date.parse(from)) ? from : defaultFrom;
+
+  if (validFrom > validTo) return { fromDay: validTo, toDay: validTo };
+
+  const spanMs = Date.parse(validTo) - Date.parse(validFrom);
+  if (spanMs > MAX_HISTORY_DAYS * 86_400_000) {
+    const cappedFrom = new Date(Date.parse(validTo) - MAX_HISTORY_DAYS * 86_400_000)
+      .toISOString()
+      .slice(0, 10);
+    return { fromDay: cappedFrom, toDay: validTo };
+  }
+  return { fromDay: validFrom, toDay: validTo };
+}
+
+/** Daily collected totals over [from, to] (capped at MAX_HISTORY_DAYS), gap-filled with zero rows. */
 export function getCollectHistoryByDay(params: {
   account?: string;
   token?: string;
@@ -3436,11 +3459,11 @@ export function getCollectHistoryByDay(params: {
   to?: string;
   network?: NetworkName;
 }): CollectHistoryDay[] {
-  const fromDay = params.from ?? new Date(Date.now() - 30 * 86_400_000).toISOString().slice(0, 10);
-  const toDay = params.to ?? new Date().toISOString().slice(0, 10);
+  const { fromDay, toDay } = clampDayRange(params.from, params.to);
+  const toExclusiveIso = new Date(Date.parse(`${toDay}T00:00:00.000Z`) + 86_400_000).toISOString();
 
-  const filters = ["event_type = 'collected'"];
-  const values: string[] = [];
+  const filters = ["event_type = 'collected'", "ledger_closed_at >= ?", "ledger_closed_at < ?"];
+  const values: string[] = [`${fromDay}T00:00:00.000Z`, toExclusiveIso];
   if (params.account) {
     filters.push("beneficiary = ?");
     values.push(params.account);
@@ -3457,15 +3480,18 @@ export function getCollectHistoryByDay(params: {
   const byDay = new Map<string, bigint>();
   for (const row of rows) {
     const day = row.ledger_closed_at.slice(0, 10);
-    if (day < fromDay || day > toDay) continue;
     byDay.set(day, (byDay.get(day) ?? 0n) + BigInt(row.amount ?? "0"));
   }
 
+  // Bounded explicitly (not just by fromDay/toDay) so a bug in clampDayRange
+  // can never turn this into an unbounded loop.
   const result: CollectHistoryDay[] = [];
-  for (const cursor = new Date(`${fromDay}T00:00:00.000Z`); ; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+  const cursor = new Date(`${fromDay}T00:00:00.000Z`);
+  for (let i = 0; i <= MAX_HISTORY_DAYS; i++) {
     const day = cursor.toISOString().slice(0, 10);
     if (day > toDay) break;
     result.push({ day, amount_collected: (byDay.get(day) ?? 0n).toString() });
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
   }
   return result;
 }
