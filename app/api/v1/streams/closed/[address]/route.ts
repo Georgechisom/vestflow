@@ -1,0 +1,6 @@
+export { GET } from "./../../../streams/closed/[address]"
+export { POST } from "./../../../streams/closed/[address]"
+export { PUT } from "./../../../streams/closed/[address]"
+export { PATCH } from "./../../../streams/closed/[address]"
+export { DELETE } from "./../../../streams/closed/[address]"
+export { HEAD } from "./../../../streams/closed/[address]"
