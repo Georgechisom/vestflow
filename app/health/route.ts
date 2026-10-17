@@ -10,6 +10,14 @@ const RPC_URL =
 
 const RPC_TIMEOUT_MS = 2000;
 
+/**
+ * Stellar ledgers close on a ~5 second cadence, so the ledger lag is
+ * converted to "seconds behind chain tip". Lag over {@link DEGRADED_LAG_SECONDS}
+ * marks the indexer degraded (#1068).
+ */
+const LEDGER_CLOSE_INTERVAL_SECONDS = 5;
+const DEGRADED_LAG_SECONDS = 60;
+
 export const runtime = "nodejs";
 
 export async function GET(): Promise<NextResponse> {
@@ -45,12 +53,20 @@ export async function GET(): Promise<NextResponse> {
     rpcConnected = false;
   }
 
-  const isHealthy = dbConnected && rpcConnected;
-  const status = isHealthy ? "ok" : "degraded";
+  // Convert ledger lag to "seconds behind chain tip" (#1068). A lag over
+  // DEGRADED_LAG_SECONDS marks the indexer degraded even when the DB and RPC
+  // probes both succeed.
+  const indexerLagSeconds = indexerLagLedgers * LEDGER_CLOSE_INTERVAL_SECONDS;
+  const isHealthy =
+    dbConnected &&
+    rpcConnected &&
+    indexerLagSeconds <= DEGRADED_LAG_SECONDS;
+  const status = isHealthy ? "healthy" : "degraded";
 
   return NextResponse.json(
     {
       status,
+      indexer_lag_seconds: indexerLagSeconds,
       indexer_lag_ledgers: indexerLagLedgers,
       rpc_connected: rpcConnected,
       db_connected: dbConnected,

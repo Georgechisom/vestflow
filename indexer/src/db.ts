@@ -3688,3 +3688,889 @@ export function queryTopSenders(
   return list.slice(0, cappedLimit);
 }
 
+// ── Stream volume (#1070) ─────────────────────────────────────────────
+
+export interface StreamVolumeStats {
+  /** Total tokens streamed to this token's receivers in the last 7 days. */
+  volume_7d: string;
+  /** Total tokens streamed to this token's receivers in the last 30 days. */
+  volume_30d: string;
+  /** Distinct streams that settled at least once in the last 7 days. */
+  stream_count_7d: number;
+  /** Distinct streams that settled at least once in the last 30 days. */
+  stream_count_30d: number;
+}
+
+const SECONDS_PER_DAY = 86_400;
+
+/**
+ * Total volume streamed for `token` over the trailing 7 and 30 day windows,
+ * aggregated from the indexed settlement cycles (`stream_cycles`, populated
+ * from `stream_received` events). Amounts are summed as bigints so large
+ * values never lose precision, then returned as decimal strings.
+ *
+ * `stream_count_*` counts the distinct receiving accounts that settled in the
+ * window — since the query is scoped to a single token, that is the number of
+ * streams that actually moved funds.
+ */
+export function getStreamVolume(
+  token: string,
+  network?: NetworkName,
+): StreamVolumeStats {
+  const now = Math.floor(Date.now() / 1000);
+  const since30d = now - 30 * SECONDS_PER_DAY;
+
+  const rows = getDb(network)
+    .prepare(
+      `SELECT account, amount_received, cycle_end_timestamp
+       FROM stream_cycles
+       WHERE token = ? AND cycle_end_timestamp >= ?`,
+    )
+    .all(token, since30d) as {
+    account: string;
+    amount_received: string;
+    cycle_end_timestamp: number;
+  }[];
+
+  const cutoff7d = now - 7 * SECONDS_PER_DAY;
+  let volume7d = 0n;
+  let volume30d = 0n;
+  const accounts7d = new Set<string>();
+  const accounts30d = new Set<string>();
+
+  for (const row of rows) {
+    let amount = 0n;
+    try {
+      amount = BigInt(row.amount_received ?? "0");
+    } catch {
+      // Ignore malformed amounts rather than failing the whole aggregate.
+    }
+
+    volume30d += amount;
+    accounts30d.add(row.account);
+
+    if (row.cycle_end_timestamp >= cutoff7d) {
+      volume7d += amount;
+      accounts7d.add(row.account);
+    }
+  }
+
+  return {
+    volume_7d: volume7d.toString(),
+    volume_30d: volume30d.toString(),
+    stream_count_7d: accounts7d.size,
+    stream_count_30d: accounts30d.size,
+  };
+}
+
+// ── Splits by receiver (#1071) ────────────────────────────────────────
+
+export interface SplitsByReceiverRow {
+  /** Account whose current splits configuration routes to the receiver. */
+  account: string;
+  /** Weight the account assigns this receiver, in basis points. */
+  weight_bps: number;
+  /** `weight_bps / 100` — the receiver's share as a percentage. */
+  percentage: number;
+}
+
+export interface SplitsByReceiverPage {
+  rows: SplitsByReceiverRow[];
+  total: number;
+}
+
+interface ParsedSplitEntry {
+  receiver: string;
+  weightBps: number | null;
+  rate: number | null;
+}
+
+function finiteNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  if (typeof value === "bigint") return Number(value);
+  return null;
+}
+
+/**
+ * Normalize the many shapes a `stream_set`/splits receiver entry can take
+ * into `{ receiver, weightBps, rate }`. Weights (`weight_bps`/`bps`/`weight`)
+ * are already basis points; rates (`amt_per_sec`/`rate_per_second`/`rate`)
+ * are converted to implied weights by the caller using the config total.
+ */
+function parseSplitEntry(value: unknown): ParsedSplitEntry | null {
+  if (Array.isArray(value)) {
+    const receiver = value[0];
+    if (typeof receiver !== "string") return null;
+    return { receiver, weightBps: null, rate: finiteNumber(value[1]) };
+  }
+  if (!value || typeof value !== "object") return null;
+
+  const entry = value as Record<string, unknown>;
+  const receiver = entry.receiver ?? entry.address ?? entry.account;
+  if (typeof receiver !== "string") return null;
+
+  const weightBps = finiteNumber(
+    entry.weight_bps ?? entry.weightBps ?? entry.bps ?? entry.weight,
+  );
+  const rate = finiteNumber(
+    entry.amt_per_sec ??
+      entry.amtPerSec ??
+      entry.rate_per_second ??
+      entry.ratePerSec ??
+      entry.new_rate ??
+      entry.newRate ??
+      entry.amount_per_second ??
+      entry.rate,
+  );
+
+  return { receiver, weightBps, rate };
+}
+
+function parseSplitEntries(raw: string): ParsedSplitEntry[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+
+  const list = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === "object" && Array.isArray((parsed as Record<string, unknown>).receivers)
+      ? ((parsed as Record<string, unknown>).receivers as unknown[])
+      : [];
+
+  const entries: ParsedSplitEntry[] = [];
+  for (const value of list) {
+    const entry = parseSplitEntry(value);
+    if (entry) entries.push(entry);
+  }
+  return entries;
+}
+
+/**
+ * Accounts whose current splits/stream configuration includes `address` as a
+ * receiver, with the weight (in basis points) and percentage they assign it.
+ *
+ * The configuration is read from `current_streams.receivers_json`, which
+ * stores each `stream_set` payload verbatim. Weights are taken as-is when the
+ * payload carries them (`weight_bps`/`weight`); otherwise they are derived
+ * from the per-receiver streaming rates relative to the config's total rate.
+ *
+ * Results are paginated (offset based), deduplicated to one row per account
+ * (the most recently updated configuration wins), and sorted by account so a
+ * page boundary is stable. Addresses with no incoming splits yield an empty
+ * page rather than a 404.
+ */
+export function querySplitsByReceiver(params: {
+  address: string;
+  limit?: number;
+  offset?: number;
+  network?: NetworkName;
+}): SplitsByReceiverPage {
+  const limit = Math.min(Math.max(params.limit ?? 50, 1), 100);
+  const offset = Math.max(params.offset ?? 0, 0);
+
+  // Most recently updated configuration first, so the first time an account
+  // is seen while scanning we keep its freshest row.
+  const rows = getDb(params.network)
+    .prepare(
+      `SELECT account, receivers_json, updated_at
+       FROM current_streams
+       ORDER BY updated_at DESC, account ASC`,
+    )
+    .all() as { account: string; receivers_json: string; updated_at: number }[];
+
+  const byAccount = new Map<string, SplitsByReceiverRow>();
+  const seen = new Set<string>();
+  for (const row of rows) {
+    // Rows are ordered freshest-first, so the first row seen for an account is
+    // its current configuration — older rows for the same account are ignored
+    // whether or not they match the receiver.
+    if (seen.has(row.account)) continue;
+    seen.add(row.account);
+
+    const entries = parseSplitEntries(row.receivers_json);
+    const match = entries.find((entry) => entry.receiver === params.address);
+    if (!match) continue;
+
+    const totalRate = entries.reduce((sum, entry) => sum + (entry.rate ?? 0), 0);
+
+    let weightBps = 0;
+    if (match.weightBps != null) {
+      weightBps = Math.round(match.weightBps);
+    } else if (match.rate != null && totalRate > 0) {
+      weightBps = Math.round((match.rate / totalRate) * 10_000);
+    }
+
+    byAccount.set(row.account, {
+      account: row.account,
+      weight_bps: weightBps,
+      percentage: Math.round(weightBps) / 100,
+    });
+  }
+
+  const all = [...byAccount.values()].sort((a, b) =>
+    a.account < b.account ? -1 : a.account > b.account ? 1 : 0,
+  );
+
+  return { rows: all.slice(offset, offset + limit), total: all.length };
+}
+
+
+// ── #828: GET /gives/:id ────────────────────────────────────────────────────
+
+/**
+ * A give's `id` is a Stellar event id, "<ledger>-<txIndex>-<eventIndex>" —
+ * not a plain integer. `tx_hash` is not currently captured by the indexer
+ * (see `InsertGiveRow` — only the event id, not the enclosing transaction
+ * hash, is stored), so it's always `null` here rather than fabricated.
+ */
+export function getGiveById(
+  id: string,
+  network?: NetworkName,
+): {
+  id: string;
+  sender: string;
+  receiver: string;
+  token: string;
+  amount: string;
+  timestamp: number;
+  ledger: number;
+  tx_hash: null;
+} | null {
+  const row = getDb(network)
+    .prepare(
+      `SELECT id, sender, receiver, token, amount_stroops AS amount, ledger, timestamp
+       FROM gives WHERE id = ?`,
+    )
+    .get(id) as
+    | { id: string; sender: string; receiver: string; token: string; amount: string; ledger: number; timestamp: number }
+    | undefined;
+  if (!row) return null;
+  return { ...row, tx_hash: null };
+}
+
+// ── #830: GET /lists/search ─────────────────────────────────────────────────
+
+export function searchDripsLists(params: {
+  q: string;
+  limit?: number;
+  cursor?: string;
+  network?: NetworkName;
+}): CursorPage<DripsList> | null {
+  const q = params.q.trim();
+  if (!q) return { items: [], nextCursor: null };
+
+  // Offset-based cursor: simpler and sufficient at this table's expected
+  // size (a keyset cursor over a computed relevance column needs the
+  // relevance bucket encoded in the cursor and re-derived on every page,
+  // which isn't worth the complexity for a search result set this small).
+  let offset = 0;
+  if (params.cursor) {
+    const decoded = Buffer.from(params.cursor, "base64url").toString("utf8");
+    offset = Number(decoded);
+    if (!Number.isInteger(offset) || offset < 0) return null;
+  }
+
+  // Relevance: exact match (0) < starts-with (1) < contains (2). SQLite has
+  // no case-insensitive LIKE for non-ASCII, but names here are expected to
+  // be ASCII identifiers; LOWER() covers the common case.
+  const nameLower = "LOWER(l.name)";
+  const qLower = q.toLowerCase();
+  const relevance = `CASE
+    WHEN ${nameLower} = ? THEN 0
+    WHEN ${nameLower} LIKE ? THEN 1
+    ELSE 2
+  END`;
+
+  const limit = Math.min(Math.max(params.limit ?? 50, 1), 50);
+  const rows = getDb(params.network)
+    .prepare(
+      `SELECT l.id, l.name, l.owner, l.token, l.total_funding_rate_per_sec,
+       COALESCE(l.target_rate_per_sec, '0') AS target_rate_per_sec,
+       COUNT(m.address) AS member_count
+     FROM drips_lists l
+     LEFT JOIN drips_list_members m ON m.list_id = l.id AND m.left_at IS NULL
+     WHERE ${nameLower} LIKE ?
+     GROUP BY l.id
+     ORDER BY ${relevance} ASC, l.name ASC, l.id ASC
+     LIMIT ? OFFSET ?`,
+    )
+    .all(qLower, qLower, `${qLower}%`, `%${qLower}%`, limit + 1, offset) as DripsList[];
+
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit);
+  return {
+    items: page,
+    nextCursor: hasMore ? Buffer.from(String(offset + limit)).toString("base64url") : null,
+  };
+}
+
+// ── #831: GET /analytics/streams/flow ───────────────────────────────────────
+
+export interface StreamFlowDay {
+  day: string; // YYYY-MM-DD
+  new_streams_rate: string;
+  closed_streams_rate: string;
+}
+
+/**
+ * Daily new-stream (outflow) vs. closed-or-expired-stream (inflow) rate
+ * totals for a flow area chart. "Closed" covers both an explicit close
+ * (`ended_at` set) and natural expiry (past `estimated_end_time` with no
+ * explicit close) — both remove the stream's rate from circulation.
+ */
+export function getStreamFlowByDay(params: {
+  token?: string;
+  from?: string;
+  to?: string;
+  network?: NetworkName;
+}): StreamFlowDay[] {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const fromSec = params.from ? Math.floor(new Date(params.from).getTime() / 1000) : nowSec - 30 * 86400;
+  const toSec = params.to ? Math.floor(new Date(params.to).getTime() / 1000) : nowSec;
+
+  const tokenClause = params.token ? "AND token = ?" : "";
+  const tokenValue = params.token ? [params.token] : [];
+
+  const newRows = getDb(params.network)
+    .prepare(
+      `SELECT strftime('%Y-%m-%d', created_at, 'unixepoch') AS day,
+              SUM(CAST(rate_per_second AS REAL)) AS rate
+       FROM drips_streams
+       WHERE created_at >= ? AND created_at <= ? ${tokenClause}
+       GROUP BY day`,
+    )
+    .all(fromSec, toSec, ...tokenValue) as { day: string; rate: number }[];
+
+  const closedRows = getDb(params.network)
+    .prepare(
+      `SELECT strftime('%Y-%m-%d', closed_at, 'unixepoch') AS day,
+              SUM(CAST(rate_per_second AS REAL)) AS rate
+       FROM (
+         SELECT rate_per_second, token,
+                COALESCE(ended_at, CASE WHEN estimated_end_time <= ? THEN estimated_end_time END) AS closed_at
+         FROM drips_streams
+       )
+       WHERE closed_at IS NOT NULL AND closed_at >= ? AND closed_at <= ? ${tokenClause}
+       GROUP BY day`,
+    )
+    .all(nowSec, fromSec, toSec, ...tokenValue) as { day: string; rate: number }[];
+
+  const newByDay = new Map(newRows.map((r) => [r.day, r.rate]));
+  const closedByDay = new Map(closedRows.map((r) => [r.day, r.rate]));
+
+  // Gap-fill every day in [from, to] with zeros, even if no activity at all.
+  const days: StreamFlowDay[] = [];
+  for (let t = fromSec - (fromSec % 86400); t <= toSec; t += 86400) {
+    const day = new Date(t * 1000).toISOString().slice(0, 10);
+    days.push({
+      day,
+      new_streams_rate: String(newByDay.get(day) ?? 0),
+      closed_streams_rate: String(closedByDay.get(day) ?? 0),
+    });
+  }
+  return days;
+}
+
+// ── #832: GET /analytics/splits/distribution ────────────────────────────────
+
+export type SplitsReceiverBucket = "1" | "2" | "3-5" | "6-10" | "10+";
+
+export interface SplitsDistributionRow {
+  receiver_count_bucket: SplitsReceiverBucket;
+  account_count: number;
+}
+
+const SPLITS_BUCKETS: SplitsReceiverBucket[] = ["1", "2", "3-5", "6-10", "10+"];
+
+function bucketForReceiverCount(count: number): SplitsReceiverBucket | null {
+  if (count <= 0) return null;
+  if (count === 1) return "1";
+  if (count === 2) return "2";
+  if (count <= 5) return "3-5";
+  if (count <= 10) return "6-10";
+  return "10+";
+}
+
+/** Distribution of split-receiver-count across accounts with a configured splits/streams receiver set. */
+export function getSplitsDistribution(network?: NetworkName): SplitsDistributionRow[] {
+  const rows = getDb(network)
+    .prepare(`SELECT receivers_json FROM current_streams`)
+    .all() as { receivers_json: string }[];
+
+  const counts = new Map<SplitsReceiverBucket, number>(SPLITS_BUCKETS.map((b) => [b, 0]));
+  for (const row of rows) {
+    let receiverCount = 0;
+    try {
+      const parsed = JSON.parse(row.receivers_json);
+      if (Array.isArray(parsed)) receiverCount = parsed.length;
+    } catch {
+      continue;
+    }
+    const bucket = bucketForReceiverCount(receiverCount);
+    if (bucket) counts.set(bucket, (counts.get(bucket) ?? 0) + 1);
+  }
+
+  return SPLITS_BUCKETS.map((bucket) => ({
+    receiver_count_bucket: bucket,
+    account_count: counts.get(bucket) ?? 0,
+  }));
+}
+
+// ── Active Streams by Token (#1062) ──────────────────────────────────
+
+export interface ActiveStreamByTokenRow {
+  id: string;
+  sender: string;
+  receiver: string;
+  rate_per_second: string;
+  start_time: number;
+  estimated_end_time: number | null;
+}
+
+export function queryActiveStreamsByToken(params: {
+  token: string;
+  limit: number;
+  cursor?: string;
+  network?: NetworkName;
+}): { items: ActiveStreamByTokenRow[]; nextCursor: string | null } {
+  const db = getDb(params.network);
+  const now = Math.floor(Date.now() / 1000);
+  const limit = Math.max(1, Math.min(params.limit, 100));
+
+  let cursorRate: string | null = null;
+  let cursorId: string | null = null;
+
+  if (params.cursor) {
+    try {
+      const decoded = Buffer.from(params.cursor, "base64url").toString("utf8");
+      const parts = decoded.split(":");
+      if (parts.length === 2) {
+        [cursorRate, cursorId] = parts;
+      } else {
+        return { items: [], nextCursor: null };
+      }
+    } catch {
+      return { items: [], nextCursor: null };
+    }
+  }
+
+  let sql: string;
+  let bindings: (string | number)[];
+
+  if (cursorRate && cursorId) {
+    sql = `
+      SELECT id, account AS sender, receiver, rate_per_second,
+             created_at AS start_time, estimated_end_time
+      FROM drips_streams
+      WHERE token = ?
+        AND ended_at IS NULL
+        AND (estimated_end_time IS NULL OR estimated_end_time > ?)
+        AND (
+          CAST(rate_per_second AS INTEGER) < CAST(? AS INTEGER)
+          OR (rate_per_second = ? AND id > ?)
+        )
+      ORDER BY CAST(rate_per_second AS INTEGER) DESC, id ASC
+      LIMIT ?`;
+    bindings = [params.token, now, cursorRate, cursorRate, cursorId, limit + 1];
+  } else {
+    sql = `
+      SELECT id, account AS sender, receiver, rate_per_second,
+             created_at AS start_time, estimated_end_time
+      FROM drips_streams
+      WHERE token = ?
+        AND ended_at IS NULL
+        AND (estimated_end_time IS NULL OR estimated_end_time > ?)
+      ORDER BY CAST(rate_per_second AS INTEGER) DESC, id ASC
+      LIMIT ?`;
+    bindings = [params.token, now, limit + 1];
+  }
+
+  const rows = db.prepare(sql).all(...bindings) as ActiveStreamByTokenRow[];
+
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit);
+
+  const last = page[page.length - 1];
+  const nextCursor =
+    hasMore && last
+      ? Buffer.from(`${last.rate_per_second}:${last.id}`).toString("base64url")
+      : null;
+
+  return { items: page, nextCursor };
+}
+
+// ── Closed Streams by Sender (#1064) ──────────────────────────────────
+
+export interface ClosedStreamRow {
+  receiver: string;
+  token: string;
+  close_time: number;
+  total_streamed: string;
+}
+
+export function queryClosedStreamsBySender(params: {
+  sender: string;
+  limit: number;
+  cursor?: string;
+  network?: NetworkName;
+}): { items: ClosedStreamRow[]; nextCursor: string | null } | null {
+  const db = getDb(params.network);
+  const limit = Math.max(1, Math.min(params.limit, 100));
+
+  let cursorTime: number | null = null;
+  let cursorId: string | null = null;
+
+  if (params.cursor) {
+    try {
+      const decoded = Buffer.from(params.cursor, "base64url").toString("utf8");
+      const parts = decoded.split(":");
+      if (parts.length === 2) {
+        cursorTime = Number(parts[0]);
+        cursorId = parts[1];
+        if (!Number.isFinite(cursorTime)) return null;
+      } else {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  let sql: string;
+  let bindings: (string | number)[];
+
+  if (cursorTime !== null && cursorId !== null) {
+    sql = `
+      SELECT ds.receiver, ds.token,
+             ds.ended_at AS close_time,
+             CAST(
+               (SELECT COALESCE(SUM(
+                 CAST(sh.old_rate AS INTEGER) *
+                 (COALESCE(
+                    LEAD(sh.timestamp) OVER (PARTITION BY sh.sender, sh.receiver, sh.token ORDER BY sh.timestamp),
+                    ds.ended_at
+                  ) - sh.timestamp)
+               ), 0)
+               FROM stream_history sh
+               WHERE sh.sender = ds.account AND sh.receiver = ds.receiver AND sh.token = ds.token
+                 AND sh.old_rate != '0'
+               ) AS TEXT
+             ) AS total_streamed
+      FROM drips_streams ds
+      WHERE ds.account = ?
+        AND ds.ended_at IS NOT NULL
+        AND (ds.ended_at < ? OR (ds.ended_at = ? AND ds.id > ?))
+      ORDER BY ds.ended_at DESC, ds.id ASC
+      LIMIT ?`;
+    bindings = [params.sender, cursorTime, cursorTime, cursorId, limit + 1];
+  } else {
+    sql = `
+      SELECT ds.receiver, ds.token,
+             ds.ended_at AS close_time,
+             CAST(
+               (SELECT COALESCE(SUM(
+                 CAST(sh.old_rate AS INTEGER) *
+                 (COALESCE(
+                    LEAD(sh.timestamp) OVER (PARTITION BY sh.sender, sh.receiver, sh.token ORDER BY sh.timestamp),
+                    ds.ended_at
+                  ) - sh.timestamp)
+               ), 0)
+               FROM stream_history sh
+               WHERE sh.sender = ds.account AND sh.receiver = ds.receiver AND sh.token = ds.token
+                 AND sh.old_rate != '0'
+               ) AS TEXT
+             ) AS total_streamed
+      FROM drips_streams ds
+      WHERE ds.account = ?
+        AND ds.ended_at IS NOT NULL
+      ORDER BY ds.ended_at DESC, ds.id ASC
+      LIMIT ?`;
+    bindings = [params.sender, limit + 1];
+  }
+
+  const rows = db.prepare(sql).all(...bindings) as ClosedStreamRow[];
+
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit);
+
+  const last = page[page.length - 1];
+  const nextCursor =
+    hasMore && last
+      ? Buffer.from(`${last.close_time}:${(last as any).id ?? ""}`).toString("base64url")
+      : null;
+
+  return { items: page, nextCursor };
+}
+
+// ── Top Givers Leaderboard (#1063) ────────────────────────────────────
+
+export interface TopGiverRow {
+  account: string;
+  total_given: string;
+  give_count: number;
+}
+
+export function queryTopGivers(
+  token: string,
+  limit: number = 20,
+  network?: NetworkName,
+): TopGiverRow[] {
+  const cappedLimit = Math.max(1, Math.min(limit, 50));
+  const db = getDb(network);
+
+  const rows = db
+    .prepare(
+      `SELECT sender AS account,
+              CAST(SUM(CAST(amount_stroops AS INTEGER)) AS TEXT) AS total_given,
+              COUNT(*) AS give_count
+       FROM gives
+       WHERE token = ?
+       GROUP BY sender
+       ORDER BY SUM(CAST(amount_stroops AS INTEGER)) DESC
+       LIMIT ?`,
+    )
+    .all(token, cappedLimit) as TopGiverRow[];
+
+  return rows;
+}
+
+// ── Drips-Lists Ecosystem Stats (#1065) ──────────────────────────────
+
+export interface DripsListsStats {
+  total_lists: number;
+  active_lists: number;
+  frozen_lists: number;
+  total_members: number;
+  total_funded_lists: number;
+}
+
+export function queryDripsListsStats(network?: NetworkName): DripsListsStats {
+  const db = getDb(network);
+
+  const totalsRow = db
+    .prepare(
+      `SELECT
+         COUNT(*) AS total_lists,
+         SUM(CASE WHEN CAST(total_funding_rate_per_sec AS INTEGER) > 0 THEN 1 ELSE 0 END) AS active_lists,
+         SUM(CASE WHEN CAST(total_funding_rate_per_sec AS INTEGER) = 0 THEN 1 ELSE 0 END) AS frozen_lists,
+         SUM(CASE WHEN CAST(target_rate_per_sec AS INTEGER) > 0 THEN 1 ELSE 0 END) AS total_funded_lists
+       FROM drips_lists`,
+    )
+    .get() as {
+      total_lists: number;
+      active_lists: number;
+      frozen_lists: number;
+      total_funded_lists: number;
+    } | undefined;
+
+  const membersRow = db
+    .prepare(
+      `SELECT COUNT(*) AS total_members FROM drips_list_members WHERE left_at IS NULL`,
+    )
+    .get() as { total_members: number } | undefined;
+
+  return {
+    total_lists: totalsRow?.total_lists ?? 0,
+    active_lists: totalsRow?.active_lists ?? 0,
+    frozen_lists: totalsRow?.frozen_lists ?? 0,
+    total_members: membersRow?.total_members ?? 0,
+    total_funded_lists: totalsRow?.total_funded_lists ?? 0,
+  };
+}
+
+// ── Batch Give Summaries (#1067) ──────────────────────────────────────
+
+export interface BatchGiveSummaryRow {
+  account: string;
+  sent_count: number;
+  received_count: number;
+  total_sent: string;
+  total_received: string;
+}
+
+export function getBatchGiveSummaries(
+  accounts: string[],
+  network?: NetworkName,
+): BatchGiveSummaryRow[] {
+  if (!accounts || accounts.length === 0) return [];
+  const db = getDb(network);
+
+  // Maximum 50 accounts enforced
+  const safeAccounts = accounts.slice(0, 50);
+
+  // Run in a single DB query using target accounts table and left joins
+  const valuesClause = safeAccounts.map(() => "(?)").join(", ");
+  const inClause = safeAccounts.map(() => "?").join(", ");
+
+  const sql = `
+    WITH target_accounts(account) AS (
+      VALUES ${valuesClause}
+    )
+    SELECT
+      t.account,
+      COALESCE(s.sent_count, 0) AS sent_count,
+      COALESCE(s.total_sent, '0') AS total_sent,
+      COALESCE(r.received_count, 0) AS received_count,
+      COALESCE(r.total_received, '0') AS total_received
+    FROM target_accounts t
+    LEFT JOIN (
+      SELECT sender, COUNT(*) AS sent_count, CAST(SUM(CAST(amount_stroops AS INTEGER)) AS TEXT) AS total_sent
+      FROM gives
+      WHERE sender IN (${inClause})
+      GROUP BY sender
+    ) s ON t.account = s.sender
+    LEFT JOIN (
+      SELECT receiver, COUNT(*) AS received_count, CAST(SUM(CAST(amount_stroops AS INTEGER)) AS TEXT) AS total_received
+      FROM gives
+      WHERE receiver IN (${inClause})
+      GROUP BY receiver
+    ) r ON t.account = r.receiver
+  `;
+
+  const params = [...safeAccounts, ...safeAccounts, ...safeAccounts];
+  const rows = db.prepare(sql).all(...params) as Array<{
+    account: string;
+    sent_count: number;
+    received_count: number;
+    total_sent: string | null;
+    total_received: string | null;
+  }>;
+
+  return rows.map((r) => ({
+    account: r.account,
+    sent_count: Number(r.sent_count ?? 0),
+    received_count: Number(r.received_count ?? 0),
+    total_sent: String(r.total_sent ?? "0"),
+    total_received: String(r.total_received ?? "0"),
+  }));
+}
+
+// ── Unified Search (#1066) ──────────────────────────────────────────
+
+export interface UnifiedSearchResults {
+  wallets: Array<{ type: "wallet"; address: string }>;
+  lists: Array<{ type: "list"; id: string; name: string; owner: string; token: string }>;
+  txs: Array<{ type: "tx"; hash: string; id: string; ledger: number }>;
+  results: Array<
+    | { type: "wallet"; address: string }
+    | { type: "list"; id: string; name: string; owner: string; token: string }
+    | { type: "tx"; hash: string; id: string; ledger: number }
+  >;
+}
+
+export function unifiedSearch(
+  query: string,
+  network?: NetworkName,
+): UnifiedSearchResults {
+  const q = query.trim();
+  if (!q) {
+    return { wallets: [], lists: [], txs: [], results: [] };
+  }
+
+  const db = getDb(network);
+
+  // 1. Wallets (address match, limit 5)
+  const walletRows = db.prepare(`
+    SELECT DISTINCT address FROM (
+      SELECT sender AS address FROM gives WHERE sender LIKE ?
+      UNION
+      SELECT receiver AS address FROM gives WHERE receiver LIKE ?
+      UNION
+      SELECT account AS address FROM drips_streams WHERE account LIKE ?
+      UNION
+      SELECT receiver AS address FROM drips_streams WHERE receiver LIKE ?
+      UNION
+      SELECT grantor AS address FROM schedule_events WHERE grantor LIKE ?
+      UNION
+      SELECT beneficiary AS address FROM schedule_events WHERE beneficiary LIKE ?
+      UNION
+      SELECT owner AS address FROM drips_lists WHERE owner LIKE ?
+    )
+    LIMIT 5
+  `).all(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`) as { address: string }[];
+
+  const wallets = walletRows.map((r) => ({
+    type: "wallet" as const,
+    address: r.address,
+  }));
+
+  // If query is an exact Stellar address not in DB yet, prepend it up to 5
+  const STELLAR_ADDRESS_RE = /^G[A-Z2-7]{55}$/;
+  if (STELLAR_ADDRESS_RE.test(q) && !wallets.some((w) => w.address === q)) {
+    wallets.unshift({ type: "wallet" as const, address: q });
+    if (wallets.length > 5) wallets.pop();
+  }
+
+  // 2. Drips Lists (name match, limit 5)
+  const listRows = db.prepare(`
+    SELECT id, name, owner, token
+    FROM drips_lists
+    WHERE name LIKE ?
+    ORDER BY
+      CASE
+        WHEN LOWER(name) = LOWER(?) THEN 0
+        WHEN LOWER(name) LIKE LOWER(?) || '%' THEN 1
+        ELSE 2
+      END,
+      created_at DESC
+    LIMIT 5
+  `).all(`%${q}%`, q, q) as Array<{ id: string; name: string; owner: string; token: string }>;
+
+  const lists = listRows.map((r) => ({
+    type: "list" as const,
+    id: r.id,
+    name: r.name,
+    owner: r.owner,
+    token: r.token,
+  }));
+
+  // 3. Transactions (hash prefix match, limit 5)
+  let txRows: Array<{ id: string; ledger: number; hash: string }> = [];
+  try {
+    const hasTxHash = (db.prepare(`PRAGMA table_info(schedule_events)`).all() as { name: string }[]).some(
+      (c) => c.name === "transaction_hash",
+    );
+
+    if (hasTxHash) {
+      txRows = db.prepare(`
+        SELECT DISTINCT id, ledger, transaction_hash AS hash
+        FROM schedule_events
+        WHERE transaction_hash LIKE ? OR id LIKE ?
+        LIMIT 5
+      `).all(`${q}%`, `${q}%`) as Array<{ id: string; ledger: number; hash: string }>;
+    } else {
+      txRows = db.prepare(`
+        SELECT DISTINCT id, ledger, id AS hash
+        FROM (
+          SELECT id, ledger FROM schedule_events WHERE id LIKE ?
+          UNION
+          SELECT id, ledger FROM gives WHERE id LIKE ?
+        )
+        LIMIT 5
+      `).all(`${q}%`, `${q}%`) as Array<{ id: string; ledger: number; hash: string }>;
+    }
+  } catch {
+    txRows = [];
+  }
+
+  const txs = txRows.map((r) => ({
+    type: "tx" as const,
+    hash: r.hash || r.id,
+    id: r.id,
+    ledger: r.ledger,
+  }));
+
+  return {
+    wallets,
+    lists,
+    txs,
+    results: [...wallets, ...lists, ...txs],
+  };
+}

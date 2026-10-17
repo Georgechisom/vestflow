@@ -33,6 +33,7 @@ import {
   runPeriodicGapDetection,
 } from "./gap-detector";
 import { ReplayEngine } from "./replay";
+import { processLedgerWithRetry } from "./ledger-retry";
 import type { EventType } from "./types";
 
 const NETWORK = parseNetwork(process.env.INDEXER_NETWORK);
@@ -222,6 +223,252 @@ function fanOutAppNotifications(fields: IndexedEventFields): void {
   }
 }
 
+/**
+ * Decode, persist, and fan out a single raw RPC event. Returns true when the
+ * event produced a new DB row. Throwing here causes the ledger it belongs to
+ * to be retried by {@link processLedgerWithRetry}.
+ */
+function processEvent(raw: any): boolean {
+  const topics = decodeTopics(raw.topic ?? []);
+  const value = decodeValue(raw.value);
+  const valueArr = asArray(value);
+  const eventType = inferEventType(topics);
+
+  let scheduleId: number | null = null;
+  let proposalId: number | null = null;
+  let grantor: string | null = null;
+  let beneficiary: string | null = null;
+  let amount: string | null = null;
+  let token: string | null = null;
+  let createdAmount: string | null = null;
+  let startTime: number | null = null;
+  let duration: number | null = null;
+  let cliffDuration: number | null = null;
+  let vestingKind: string | null = null;
+
+  switch (eventType) {
+    case "schedule_created":
+      // Current contract: topics ["created", id],
+      // value [grantor, beneficiary, token, total_amount, ...].
+      // Older deployments used topics ["created", grantor, beneficiary, token],
+      // value [id, total_amount]; keep both decoders for replay safety.
+      scheduleId =
+        topics[1] != null && !Number.isNaN(Number(topics[1]))
+          ? Number(topics[1])
+          : valueArr[0] != null
+            ? Number(valueArr[0])
+            : null;
+      grantor =
+        valueArr[0] != null && scheduleId === Number(topics[1])
+          ? toStr(valueArr[0])
+          : toStr(topics[1]);
+      beneficiary =
+        valueArr[1] != null && scheduleId === Number(topics[1])
+          ? toStr(valueArr[1])
+          : toStr(topics[2]);
+      token =
+        valueArr[2] != null && scheduleId === Number(topics[1])
+          ? toStr(valueArr[2])
+          : toStr(topics[3]);
+      createdAmount =
+        valueArr[3] != null && scheduleId === Number(topics[1])
+          ? String(valueArr[3])
+          : valueArr[1] != null
+            ? String(valueArr[1])
+            : null;
+      // Vesting curve params: only present in the current event shape
+      // (grantor, beneficiary, token, total_amount, start_time,
+      // duration, cliff_duration, vesting_kind, ...). Older replayed
+      // events lack these — the analytics worker falls back to
+      // claimed-only accounting when they're null.
+      if (scheduleId === Number(topics[1])) {
+        startTime = valueArr[4] != null ? Number(valueArr[4]) : null;
+        duration = valueArr[5] != null ? Number(valueArr[5]) : null;
+        cliffDuration = valueArr[6] != null ? Number(valueArr[6]) : null;
+        vestingKind = valueArr[7] != null ? String(valueArr[7]) : null;
+      }
+      break;
+    case "claimed":
+      // topics: ["claimed", beneficiary, token]
+      // value: [schedule_id, claimable, total_claimed]
+      beneficiary = toStr(topics[1]);
+      token = toStr(topics[2]);
+      scheduleId = valueArr[0] != null ? Number(valueArr[0]) : null;
+      amount = valueArr[1] != null ? String(valueArr[1]) : null;
+      break;
+    case "revoked":
+      // topics: ["revoked", grantor, token]
+      // value: [schedule_id, unvested, vested]
+      grantor = toStr(topics[1]);
+      token = toStr(topics[2]);
+      scheduleId = valueArr[0] != null ? Number(valueArr[0]) : null;
+      break;
+    case "proposal_created":
+      // topics: ["prop_new", proposal_id]
+      // value: [grantor, beneficiary, token, total_amount]
+      proposalId = topics[1] != null ? Number(topics[1]) : null;
+      grantor = toStr(valueArr[0]);
+      beneficiary = toStr(valueArr[1]);
+      token = toStr(valueArr[2]);
+      createdAmount = valueArr[3] != null ? String(valueArr[3]) : null;
+      break;
+    case "proposal_acknowledged":
+      // topics: ["prop_ack", proposal_id]
+      // value: [beneficiary, ledger]
+      proposalId = topics[1] != null ? Number(topics[1]) : null;
+      beneficiary = toStr(valueArr[0]);
+      break;
+    case "proposal_activated":
+      // topics: ["prop_act", proposal_id]
+      // value: schedule_id
+      proposalId = topics[1] != null ? Number(topics[1]) : null;
+      scheduleId =
+        value != null && !Array.isArray(value)
+          ? Number(value)
+          : valueArr[0] != null
+            ? Number(valueArr[0])
+            : null;
+      break;
+    case "proposal_expired":
+      // topics: ["prop_exp", proposal_id]
+      // value: expired_by
+      proposalId = topics[1] != null ? Number(topics[1]) : null;
+      grantor = toStr(
+        Array.isArray(value) || (value && typeof value === "object")
+          ? valueArr[0]
+          : value,
+      );
+      break;
+    case "stream_set":
+      grantor = toStr(topics[1]);
+      token = toStr(topics.length >= 4 ? topics[3] : topics[2]);
+      break;
+    case "given":
+      // topics: ["given", sender, receiver, token]
+      // value: amount_stroops, or [amount_stroops, ...metadata]
+      grantor = toStr(topics[1]);
+      beneficiary = toStr(topics[2]);
+      token = toStr(topics[3]);
+      amount =
+        Array.isArray(value) || (value && typeof value === "object")
+          ? valueArr[0] != null
+            ? String(valueArr[0])
+            : null
+          : value != null
+            ? String(value)
+            : null;
+      break;
+    case "collected":
+      // topics: ["collected", account, token]
+      // value: amount_stroops, or [amount_stroops, ...metadata]
+      beneficiary = toStr(topics[1]);
+      token = toStr(topics[2]);
+      amount =
+        Array.isArray(value) || (value && typeof value === "object")
+          ? valueArr[0] != null
+            ? String(valueArr[0])
+            : null
+          : value != null
+            ? String(value)
+            : null;
+      break;
+    case "stream_received":
+      // topics: ["strm_recv", account, token]
+      // value: [cycles_processed, amount_received]
+      beneficiary = toStr(topics[1]);
+      token = toStr(topics[2]);
+      amount =
+        valueArr[1] != null
+          ? String(valueArr[1])
+          : valueArr[0] != null
+            ? String(valueArr[0])
+            : null;
+      break;
+    case "squeezed":
+      // topics: ["squeezed", receiver, sender, token]
+      // value: [amount_stroops, cycle_id, history_hash]
+      beneficiary = toStr(topics[1]);
+      grantor = toStr(topics[2]);
+      token = toStr(topics[3]);
+      amount = valueArr[0] != null ? String(valueArr[0]) : null;
+      break;
+  }
+
+  const isNew = insertEvent(
+    {
+      id: raw.id,
+      event_type: eventType,
+      ledger: raw.ledger,
+      ledger_closed_at: raw.ledgerClosedAt,
+      schedule_id: scheduleId,
+      proposal_id: proposalId,
+      grantor,
+      beneficiary,
+      amount,
+      token,
+      created_amount: createdAmount,
+      start_time: startTime,
+      duration,
+      cliff_duration: cliffDuration,
+      vesting_kind: vestingKind,
+      raw_topics: jsonStringify(topics),
+      raw_value: jsonStringify(value),
+    },
+    NETWORK,
+  );
+
+  if (isNew) {
+    // Populate beneficiary index for O(1) lookup
+    if (
+      eventType === "schedule_created" &&
+      beneficiary &&
+      scheduleId !== null
+    ) {
+      insertBeneficiarySchedule(beneficiary, scheduleId, NETWORK);
+    }
+    // Queue webhook deliveries. This only writes rows — the HTTP
+    // requests happen on the delivery worker pool, so a slow or dead
+    // subscriber can never stall indexing.
+    try {
+      fanOutEvent(
+        {
+          event_id: raw.id,
+          event_type: eventType,
+          network: NETWORK,
+          ledger: raw.ledger,
+          ledger_closed_at: raw.ledgerClosedAt,
+          schedule_id: scheduleId,
+          proposal_id: proposalId,
+          grantor,
+          beneficiary,
+          token,
+          amount,
+          created_amount: createdAmount,
+        },
+        NETWORK,
+      );
+    } catch (err) {
+      console.error("[poller] Webhook fan-out failed:", err);
+    }
+
+    // Write in-app notifications for the affected wallets so the SSE
+    // stream can push them out.
+    fanOutAppNotifications({
+      event_id: raw.id,
+      event_type: eventType,
+      ledger: raw.ledger,
+      ledger_closed_at: raw.ledgerClosedAt,
+      schedule_id: scheduleId,
+      grantor,
+      beneficiary,
+      token,
+      amount,
+    });
+  }
+
+  return isNew;
+}
+
 // ── Core poll ─────────────────────────────────────────────────────────
 
 async function poll(): Promise<void> {
@@ -249,245 +496,37 @@ async function poll(): Promise<void> {
 
       const events: any[] = response.events ?? [];
 
+      // Group the page's events by ledger so a failure while processing one
+      // ledger is retried on its own with exponential backoff (#1069). A
+      // ledger that exhausts its retries is logged and skipped.
+      const eventsByLedger = new Map<number, any[]>();
       for (const raw of events) {
-        const topics = decodeTopics(raw.topic ?? []);
-        const value = decodeValue(raw.value);
-        const valueArr = asArray(value);
-        const eventType = inferEventType(topics);
-
-        let scheduleId: number | null = null;
-        let proposalId: number | null = null;
-        let grantor: string | null = null;
-        let beneficiary: string | null = null;
-        let amount: string | null = null;
-        let token: string | null = null;
-        let createdAmount: string | null = null;
-        let startTime: number | null = null;
-        let duration: number | null = null;
-        let cliffDuration: number | null = null;
-        let vestingKind: string | null = null;
-
-        switch (eventType) {
-          case "schedule_created":
-            // Current contract: topics ["created", id],
-            // value [grantor, beneficiary, token, total_amount, ...].
-            // Older deployments used topics ["created", grantor, beneficiary, token],
-            // value [id, total_amount]; keep both decoders for replay safety.
-            scheduleId =
-              topics[1] != null && !Number.isNaN(Number(topics[1]))
-                ? Number(topics[1])
-                : valueArr[0] != null
-                  ? Number(valueArr[0])
-                  : null;
-            grantor =
-              valueArr[0] != null && scheduleId === Number(topics[1])
-                ? toStr(valueArr[0])
-                : toStr(topics[1]);
-            beneficiary =
-              valueArr[1] != null && scheduleId === Number(topics[1])
-                ? toStr(valueArr[1])
-                : toStr(topics[2]);
-            token =
-              valueArr[2] != null && scheduleId === Number(topics[1])
-                ? toStr(valueArr[2])
-                : toStr(topics[3]);
-            createdAmount =
-              valueArr[3] != null && scheduleId === Number(topics[1])
-                ? String(valueArr[3])
-                : valueArr[1] != null
-                  ? String(valueArr[1])
-                  : null;
-            // Vesting curve params: only present in the current event shape
-            // (grantor, beneficiary, token, total_amount, start_time,
-            // duration, cliff_duration, vesting_kind, ...). Older replayed
-            // events lack these — the analytics worker falls back to
-            // claimed-only accounting when they're null.
-            if (scheduleId === Number(topics[1])) {
-              startTime = valueArr[4] != null ? Number(valueArr[4]) : null;
-              duration = valueArr[5] != null ? Number(valueArr[5]) : null;
-              cliffDuration = valueArr[6] != null ? Number(valueArr[6]) : null;
-              vestingKind = valueArr[7] != null ? String(valueArr[7]) : null;
-            }
-            break;
-          case "claimed":
-            // topics: ["claimed", beneficiary, token]
-            // value: [schedule_id, claimable, total_claimed]
-            beneficiary = toStr(topics[1]);
-            token = toStr(topics[2]);
-            scheduleId = valueArr[0] != null ? Number(valueArr[0]) : null;
-            amount = valueArr[1] != null ? String(valueArr[1]) : null;
-            break;
-          case "revoked":
-            // topics: ["revoked", grantor, token]
-            // value: [schedule_id, unvested, vested]
-            grantor = toStr(topics[1]);
-            token = toStr(topics[2]);
-            scheduleId = valueArr[0] != null ? Number(valueArr[0]) : null;
-            break;
-          case "proposal_created":
-            // topics: ["prop_new", proposal_id]
-            // value: [grantor, beneficiary, token, total_amount]
-            proposalId = topics[1] != null ? Number(topics[1]) : null;
-            grantor = toStr(valueArr[0]);
-            beneficiary = toStr(valueArr[1]);
-            token = toStr(valueArr[2]);
-            createdAmount = valueArr[3] != null ? String(valueArr[3]) : null;
-            break;
-          case "proposal_acknowledged":
-            // topics: ["prop_ack", proposal_id]
-            // value: [beneficiary, ledger]
-            proposalId = topics[1] != null ? Number(topics[1]) : null;
-            beneficiary = toStr(valueArr[0]);
-            break;
-          case "proposal_activated":
-            // topics: ["prop_act", proposal_id]
-            // value: schedule_id
-            proposalId = topics[1] != null ? Number(topics[1]) : null;
-            scheduleId =
-              value != null && !Array.isArray(value)
-                ? Number(value)
-                : valueArr[0] != null
-                  ? Number(valueArr[0])
-                  : null;
-            break;
-          case "proposal_expired":
-            // topics: ["prop_exp", proposal_id]
-            // value: expired_by
-            proposalId = topics[1] != null ? Number(topics[1]) : null;
-            grantor = toStr(
-              Array.isArray(value) || (value && typeof value === "object")
-                ? valueArr[0]
-                : value,
-            );
-            break;
-          case "stream_set":
-            grantor = toStr(topics[1]);
-            token = toStr(topics.length >= 4 ? topics[3] : topics[2]);
-            break;
-          case "given":
-            // topics: ["given", sender, receiver, token]
-            // value: amount_stroops, or [amount_stroops, ...metadata]
-            grantor = toStr(topics[1]);
-            beneficiary = toStr(topics[2]);
-            token = toStr(topics[3]);
-            amount =
-              Array.isArray(value) || (value && typeof value === "object")
-                ? valueArr[0] != null
-                  ? String(valueArr[0])
-                  : null
-                : value != null
-                  ? String(value)
-                  : null;
-            break;
-          case "collected":
-            // topics: ["collected", account, token]
-            // value: amount_stroops, or [amount_stroops, ...metadata]
-            beneficiary = toStr(topics[1]);
-            token = toStr(topics[2]);
-            amount =
-              Array.isArray(value) || (value && typeof value === "object")
-                ? valueArr[0] != null
-                  ? String(valueArr[0])
-                  : null
-                : value != null
-                  ? String(value)
-                  : null;
-            break;
-          case "stream_received":
-            // topics: ["strm_recv", account, token]
-            // value: [cycles_processed, amount_received]
-            beneficiary = toStr(topics[1]);
-            token = toStr(topics[2]);
-            amount =
-              valueArr[1] != null
-                ? String(valueArr[1])
-                : valueArr[0] != null
-                  ? String(valueArr[0])
-                  : null;
-            break;
-          case "squeezed":
-            // topics: ["squeezed", receiver, sender, token]
-            // value: [amount_stroops, cycle_id, history_hash]
-            beneficiary = toStr(topics[1]);
-            grantor = toStr(topics[2]);
-            token = toStr(topics[3]);
-            amount = valueArr[0] != null ? String(valueArr[0]) : null;
-            break;
+        const ledger = Number(raw.ledger);
+        const group = eventsByLedger.get(ledger);
+        if (group) {
+          group.push(raw);
+        } else {
+          eventsByLedger.set(ledger, [raw]);
         }
+      }
 
-        const isNew = insertEvent(
-          {
-            id: raw.id,
-            event_type: eventType,
-            ledger: raw.ledger,
-            ledger_closed_at: raw.ledgerClosedAt,
-            schedule_id: scheduleId,
-            proposal_id: proposalId,
-            grantor,
-            beneficiary,
-            amount,
-            token,
-            created_amount: createdAmount,
-            start_time: startTime,
-            duration,
-            cliff_duration: cliffDuration,
-            vesting_kind: vestingKind,
-            raw_topics: jsonStringify(topics),
-            raw_value: jsonStringify(value),
+      for (const [ledger, ledgerEvents] of eventsByLedger) {
+        const result = await processLedgerWithRetry(
+          ledger,
+          () => {
+            let newEvents = 0;
+            for (const raw of ledgerEvents) {
+              if (processEvent(raw)) newEvents += 1;
+            }
+            return newEvents;
           },
-          NETWORK,
+          { label: "[poller]" },
         );
 
-        if (isNew) {
-          ingested++;
-          // Populate beneficiary index for O(1) lookup
-          if (
-            eventType === "schedule_created" &&
-            beneficiary &&
-            scheduleId !== null
-          ) {
-            insertBeneficiarySchedule(beneficiary, scheduleId, NETWORK);
-          }
-          // Queue webhook deliveries. This only writes rows — the HTTP
-          // requests happen on the delivery worker pool, so a slow or dead
-          // subscriber can never stall indexing.
-          try {
-            fanOutEvent(
-              {
-                event_id: raw.id,
-                event_type: eventType,
-                network: NETWORK,
-                ledger: raw.ledger,
-                ledger_closed_at: raw.ledgerClosedAt,
-                schedule_id: scheduleId,
-                proposal_id: proposalId,
-                grantor,
-                beneficiary,
-                token,
-                amount,
-                created_amount: createdAmount,
-              },
-              NETWORK,
-            );
-          } catch (err) {
-            console.error("[poller] Webhook fan-out failed:", err);
-          }
-
-          // Write in-app notifications for the affected wallets so the SSE
-          // stream can push them out.
-          fanOutAppNotifications({
-            event_id: raw.id,
-            event_type: eventType,
-            ledger: raw.ledger,
-            ledger_closed_at: raw.ledgerClosedAt,
-            schedule_id: scheduleId,
-            grantor,
-            beneficiary,
-            token,
-            amount,
-          });
-        }
-        if (raw.ledger > highestLedger) highestLedger = raw.ledger;
+        if (result.success) ingested += result.value ?? 0;
+        // Advance past the ledger whether it succeeded or was permanently
+        // failed — a skipped ledger must not stall the checkpoint forever.
+        if (ledger > highestLedger) highestLedger = ledger;
       }
 
       // Checkpoint after each successful page so a mid-batch crash

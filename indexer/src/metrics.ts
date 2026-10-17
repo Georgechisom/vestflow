@@ -62,6 +62,9 @@ export function metricsRoute(pathname: string): string {
   if (/^\/gives\/summary\/[^/]+$/.test(pathname)) {
     return "/gives/summary/:address";
   }
+  if (/^\/splits\/by-receiver\/[^/]+$/.test(pathname)) {
+    return "/splits/by-receiver/:address";
+  }
   return pathname;
 }
 
@@ -154,7 +157,11 @@ async function latestLedger(network: NetworkName): Promise<number | null> {
   }
 }
 
-async function indexerLag(network: NetworkName): Promise<number> {
+/**
+ * How many ledgers behind the chain tip the indexer currently is. Reusable by
+ * the `/health` probe (#1068) as well as the Prometheus metrics endpoint.
+ */
+export async function getIndexerLag(network: NetworkName): Promise<number> {
   const checkpoint = getCheckpoint(network);
   const current = await latestLedger(network);
   return current === null ? 0 : Math.max(0, current - checkpoint);
@@ -189,7 +196,7 @@ export async function renderPrometheusMetrics(
 ): Promise<string> {
   getDatabasePoolConfig();
   const activeStreams = getActiveStreamsCount(network);
-  const lag = await indexerLag(network);
+  const lag = await getIndexerLag(network);
   const poolActive = poolConnectionsActive();
   const lines: string[] = [
     "# HELP http_requests_total Total HTTP requests handled by the indexer.",

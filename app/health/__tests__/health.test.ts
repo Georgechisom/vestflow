@@ -32,7 +32,7 @@ describe("GET /health (#675)", () => {
     vi.restoreAllMocks();
   });
 
-  it("returns 200 with status ok when all checks pass", async () => {
+  it("returns 200 with status healthy when all checks pass", async () => {
     mockGetDb.mockReturnValue({ prepare: vi.fn().mockReturnValue({ get: vi.fn() }) });
     vi.doMock("@stellar/stellar-sdk", () => mockStellarRpc(110));
 
@@ -41,10 +41,11 @@ describe("GET /health (#675)", () => {
     const body = await response.json();
 
     expect(response.status).toBe(200);
-    expect(body.status).toBe("ok");
+    expect(body.status).toBe("healthy");
     expect(body.db_connected).toBe(true);
     expect(body.rpc_connected).toBe(true);
     expect(body.indexer_lag_ledgers).toBe(10);
+    expect(body.indexer_lag_seconds).toBe(50);
   });
 
   it("returns 503 with status degraded when DB check fails", async () => {
@@ -120,7 +121,25 @@ describe("GET /health (#675)", () => {
     const body = await response.json();
 
     expect(body.indexer_lag_ledgers).toBe(0);
+    expect(body.indexer_lag_seconds).toBe(0);
     expect(body.rpc_connected).toBe(false);
+  });
+
+  it("returns 503 with status degraded when indexer lag exceeds 60s", async () => {
+    mockGetDb.mockReturnValue({ prepare: vi.fn().mockReturnValue({ get: vi.fn() }) });
+    mockGetCheckpoint.mockReturnValue(100);
+    // 25 ledgers behind at ~5s per ledger = 125s, over the 60s threshold.
+    vi.doMock("@stellar/stellar-sdk", () => mockStellarRpc(125));
+
+    const { GET } = await import("@/app/health/route");
+    const response = await GET();
+    const body = await response.json();
+
+    expect(response.status).toBe(503);
+    expect(body.status).toBe("degraded");
+    expect(body.db_connected).toBe(true);
+    expect(body.rpc_connected).toBe(true);
+    expect(body.indexer_lag_seconds).toBe(125);
   });
 
   it("calculates indexer lag correctly", async () => {
@@ -154,9 +173,11 @@ describe("GET /health (#675)", () => {
     const body = await response.json();
 
     expect(body).toHaveProperty("status");
+    expect(body).toHaveProperty("indexer_lag_seconds");
     expect(body).toHaveProperty("indexer_lag_ledgers");
     expect(body).toHaveProperty("rpc_connected");
     expect(body).toHaveProperty("db_connected");
+    expect(typeof body.indexer_lag_seconds).toBe("number");
     expect(typeof body.indexer_lag_ledgers).toBe("number");
     expect(typeof body.rpc_connected).toBe("boolean");
     expect(typeof body.db_connected).toBe("boolean");
