@@ -18,6 +18,8 @@ import { URL } from "url";
 import { createHash } from "node:crypto";
 import {
   getCheckpoint,
+  getStreamVolume,
+  querySplitsByReceiver,
   getDripsStreamingTvl,
   getDripsStreamsLastUpdated,
   getGiveSummary,
@@ -48,13 +50,14 @@ import {
   getGrantorSummary,
 } from "./analytics";
 import { cacheKey, cacheGet, cacheSet } from "./analytics-cache";
-import { getDatabasePoolConfig } from "./config";
+import { getDatabasePoolConfig, parseNetwork } from "./config";
 import {
   getCachedTokenDecimals,
   getTokenDecimals,
   stroopsToDisplay,
 } from "./token-metadata";
 import {
+  getIndexerLag,
   isMetricsAuthorized,
   metricsRoute,
   recordHttpRequest,
@@ -331,10 +334,56 @@ async function handleMetrics(
   }
 }
 
-function handleHealth(res: http.ServerResponse): void {
-  json(res, 200, {
-    ok: true,
-    checkpoint: getCheckpoint(),
+/**
+ * Stellar ledgers close on a ~5 second cadence. Used to convert an indexer
+ * ledger lag into a wall-clock "seconds behind chain tip" figure (#1068)
+ * without a second RPC round-trip for close times.
+ */
+const LEDGER_CLOSE_INTERVAL_SECONDS = 5;
+
+/**
+ * Indexer lag threshold (seconds) above which /health reports `degraded`.
+ */
+const DEGRADED_LAG_SECONDS = 60;
+
+/**
+ * GET /health — liveness plus indexer lag.
+ *
+ * `indexer_lag_seconds` is how far behind the chain tip the indexer is;
+ * anything over {@link DEGRADED_LAG_SECONDS} flips `status` to `degraded`.
+ */
+async function handleHealth(res: http.ServerResponse): Promise<void> {
+  let network: ReturnType<typeof parseNetwork>;
+  try {
+    network = parseNetwork(process.env.INDEXER_NETWORK);
+  } catch {
+    network = "testnet";
+  }
+
+  let lagSeconds = 0;
+  try {
+    const lagLedgers = await getIndexerLag(network);
+    lagSeconds = lagLedgers * LEDGER_CLOSE_INTERVAL_SECONDS;
+  } catch (error) {
+    console.error("[server] Failed to compute indexer lag:", error);
+    lagSeconds = 0;
+  }
+
+  let checkpoint = 0;
+  try {
+    checkpoint = getCheckpoint(network);
+  } catch (error) {
+    console.error("[server] Failed to read checkpoint:", error);
+  }
+
+  const status = lagSeconds > DEGRADED_LAG_SECONDS ? "degraded" : "healthy";
+
+  json(res, status === "healthy" ? 200 : 503, {
+    ok: status === "healthy",
+    status,
+    network,
+    checkpoint,
+    indexer_lag_seconds: lagSeconds,
   });
 }
 
@@ -807,6 +856,95 @@ function handleAnalyticsTopReceivers(
   return json(res, 200, { receivers, cached: !!cached });
 }
 
+/** In-memory TTL for the stream-volume aggregate (#1070): 10 minutes. */
+const STREAM_VOLUME_CACHE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * GET /analytics/stream-volume?token= — total token volume streamed over the
+ * trailing 7 and 30 day windows, plus the number of streams that settled in
+ * each window (#1070). Responses are cached for 10 minutes.
+ */
+function handleStreamVolume(
+  res: http.ServerResponse,
+  searchParams: URLSearchParams,
+): void {
+  const token = searchParams.get("token");
+  if (!token) {
+    return json(res, 400, { error: "token query param is required" });
+  }
+
+  const network = networkParam(searchParams);
+  if (!network) {
+    return json(res, 400, { error: "network must be mainnet or testnet" });
+  }
+
+  const key = cacheKey(`stream-volume:${network}:${token}`, "7d", "30d", false);
+  const cached = cacheGet<ReturnType<typeof getStreamVolume>>(key);
+  const stats = cached ?? getStreamVolume(token, network);
+  if (!cached) {
+    // `"rolling"` is a non-date marker: the entry opts out of per-ledger
+    // invalidation and simply expires after the 10 minute TTL.
+    cacheSet(key, stats, "rolling", STREAM_VOLUME_CACHE_TTL_MS);
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Cache-Control": "public, max-age=600, stale-while-revalidate=120",
+  });
+  res.end(JSON.stringify(stats));
+}
+
+/**
+ * GET /splits/by-receiver/:address — accounts whose current splits
+ * configuration routes to `address`, with the weight (bps) and percentage
+ * each account assigns it (#1071). Offset-paginated via `limit`/`offset`.
+ */
+function handleSplitsByReceiver(
+  res: http.ServerResponse,
+  address: string,
+  searchParams: URLSearchParams,
+): void {
+  if (!STELLAR_ADDRESS.test(address)) {
+    return json(res, 400, { error: "address must be a valid Stellar address" });
+  }
+
+  const network = networkParam(searchParams);
+  if (!network) {
+    return json(res, 400, { error: "network must be mainnet or testnet" });
+  }
+
+  const limit = limitParam(searchParams);
+  const offsetRaw = searchParams.get("offset");
+  let offset = 0;
+  if (offsetRaw != null) {
+    const parsed = Number(offsetRaw);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      return json(res, 400, { error: "offset must be a non-negative integer" });
+    }
+    offset = parsed;
+  }
+  if (limit === null) {
+    return json(res, 400, { error: "limit must be a positive integer" });
+  }
+
+  const page = querySplitsByReceiver({
+    address,
+    limit: limit === undefined ? undefined : Math.min(limit, 100),
+    offset,
+    network,
+  });
+
+  return json(res, 200, {
+    address,
+    accounts: page.rows,
+    total: page.total,
+    limit: limit === undefined ? 50 : Math.min(limit, 100),
+    offset,
+    has_more: offset + page.rows.length < page.total,
+  });
+}
+
 export function createServer(): http.Server {
   getDatabasePoolConfig();
   return http.createServer(async (req, res) => {
@@ -909,6 +1047,9 @@ export function createServer(): http.Server {
     const streamConfigMatch = url.pathname.match(
       /^\/streams\/([^/]+)\/([^/]+)\/([^/]+)$/,
     );
+    const splitsByReceiverMatch = url.pathname.match(
+      /^\/splits\/by-receiver\/([^/]+)$/,
+    );
 
     switch (url.pathname) {
       case "/metrics":
@@ -935,6 +1076,9 @@ export function createServer(): http.Server {
       case "/analytics/top-receivers":
         return handleAnalyticsTopReceivers(res, url.searchParams);
 
+      case "/analytics/stream-volume":
+        return handleStreamVolume(res, url.searchParams);
+
       case "/gives":
         return handleGives(res, url.searchParams);
       case "/analytics/streams/tvl":
@@ -952,6 +1096,13 @@ export function createServer(): http.Server {
         return handleSplits(res, url.searchParams, req.headers["if-none-match"]);
 
       default:
+        if (splitsByReceiverMatch) {
+          return handleSplitsByReceiver(
+            res,
+            decodeURIComponent(splitsByReceiverMatch[1]),
+            url.searchParams,
+          );
+        }
         if (streamHistoryMatch) {
           return handleStreamHistory(
             res,
