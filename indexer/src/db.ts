@@ -3586,6 +3586,143 @@ export function getActiveStreamsCount(network?: NetworkName): number {
   return row?.count ?? 0;
 }
 
+// ── #1051: GET /analytics/collections/history ───────────────────────────
+
+export interface CollectHistoryDay {
+  day: string;
+  amount_collected: string;
+}
+
+const ISO_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const MAX_HISTORY_DAYS = 366;
+
+/** Validates/clamps an untrusted [from, to] day range to at most MAX_HISTORY_DAYS. */
+function clampDayRange(from?: string, to?: string): { fromDay: string; toDay: string } {
+  const defaultTo = new Date().toISOString().slice(0, 10);
+  const defaultFrom = new Date(Date.now() - 30 * 86_400_000).toISOString().slice(0, 10);
+
+  const validTo = to && ISO_DAY_RE.test(to) && !Number.isNaN(Date.parse(to)) ? to : defaultTo;
+  const validFrom = from && ISO_DAY_RE.test(from) && !Number.isNaN(Date.parse(from)) ? from : defaultFrom;
+
+  if (validFrom > validTo) return { fromDay: validTo, toDay: validTo };
+
+  const spanMs = Date.parse(validTo) - Date.parse(validFrom);
+  if (spanMs > MAX_HISTORY_DAYS * 86_400_000) {
+    const cappedFrom = new Date(Date.parse(validTo) - MAX_HISTORY_DAYS * 86_400_000)
+      .toISOString()
+      .slice(0, 10);
+    return { fromDay: cappedFrom, toDay: validTo };
+  }
+  return { fromDay: validFrom, toDay: validTo };
+}
+
+/** Daily collected totals over [from, to] (capped at MAX_HISTORY_DAYS), gap-filled with zero rows. */
+export function getCollectHistoryByDay(params: {
+  account?: string;
+  token?: string;
+  from?: string;
+  to?: string;
+  network?: NetworkName;
+}): CollectHistoryDay[] {
+  const { fromDay, toDay } = clampDayRange(params.from, params.to);
+  const toExclusiveIso = new Date(Date.parse(`${toDay}T00:00:00.000Z`) + 86_400_000).toISOString();
+
+  const filters = ["event_type = 'collected'", "ledger_closed_at >= ?", "ledger_closed_at < ?"];
+  const values: string[] = [`${fromDay}T00:00:00.000Z`, toExclusiveIso];
+  if (params.account) {
+    filters.push("beneficiary = ?");
+    values.push(params.account);
+  }
+  if (params.token) {
+    filters.push("token = ?");
+    values.push(params.token);
+  }
+
+  const rows = getDb(params.network)
+    .prepare(`SELECT ledger_closed_at, amount FROM schedule_events WHERE ${filters.join(" AND ")}`)
+    .all(...values) as { ledger_closed_at: string; amount: string | null }[];
+
+  const byDay = new Map<string, bigint>();
+  for (const row of rows) {
+    const day = row.ledger_closed_at.slice(0, 10);
+    byDay.set(day, (byDay.get(day) ?? 0n) + BigInt(row.amount ?? "0"));
+  }
+
+  // Bounded explicitly (not just by fromDay/toDay) so a bug in clampDayRange
+  // can never turn this into an unbounded loop.
+  const result: CollectHistoryDay[] = [];
+  const cursor = new Date(`${fromDay}T00:00:00.000Z`);
+  for (let i = 0; i <= MAX_HISTORY_DAYS; i++) {
+    const day = cursor.toISOString().slice(0, 10);
+    if (day > toDay) break;
+    result.push({ day, amount_collected: (byDay.get(day) ?? 0n).toString() });
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return result;
+}
+
+// ── #1050: GET /analytics/active-wallets ─────────────────────────────────
+
+/** Distinct wallets that streamed, gave, or collected in the last `days` days. */
+export function getActiveWalletsCount(days: number, network?: NetworkName): number {
+  const sinceSec = Math.floor(Date.now() / 1000) - days * 86_400;
+  const sinceIso = new Date(sinceSec * 1000).toISOString();
+  const row = getDb(network)
+    .prepare(
+      `SELECT COUNT(DISTINCT addr) AS count FROM (
+         SELECT sender AS addr FROM stream_history WHERE timestamp >= ?
+         UNION SELECT sender AS addr FROM gives WHERE timestamp >= ?
+         UNION SELECT beneficiary AS addr FROM schedule_events
+           WHERE event_type = 'collected' AND ledger_closed_at >= ?
+       )`,
+    )
+    .get(sinceSec, sinceSec, sinceIso) as { count: number } | undefined;
+  return row?.count ?? 0;
+}
+
+// ── #1049: GET /analytics/protocol/totals (Drips) ────────────────────────
+
+export interface DripsProtocolTotals {
+  total_streams_ever: number;
+  active_streams: number;
+  total_given_all_time: string;
+  total_collected_all_time: string;
+  unique_wallets: number;
+}
+
+export function getDripsProtocolTotals(network?: NetworkName): DripsProtocolTotals {
+  const db = getDb(network);
+  const totalStreamsEver = (db.prepare("SELECT COUNT(*) AS c FROM drips_streams").get() as { c: number }).c;
+
+  const givenRows = db.prepare("SELECT amount_stroops AS v FROM gives").all() as { v: string }[];
+  const totalGiven = givenRows.reduce((sum, r) => sum + BigInt(r.v), 0n);
+
+  const collectedRows = db
+    .prepare("SELECT total_collected_stroops AS v FROM collected_totals")
+    .all() as { v: string }[];
+  const totalCollected = collectedRows.reduce((sum, r) => sum + BigInt(r.v), 0n);
+
+  const uniqueWallets = (
+    db
+      .prepare(
+        `SELECT COUNT(DISTINCT addr) AS c FROM (
+           SELECT sender AS addr FROM stream_history
+           UNION SELECT sender AS addr FROM gives
+           UNION SELECT beneficiary AS addr FROM schedule_events WHERE event_type = 'collected'
+         )`,
+      )
+      .get() as { c: number }
+  ).c;
+
+  return {
+    total_streams_ever: totalStreamsEver,
+    active_streams: getActiveStreamsCount(network),
+    total_given_all_time: totalGiven.toString(),
+    total_collected_all_time: totalCollected.toString(),
+    unique_wallets: uniqueWallets,
+  };
+}
+
 // ── Top Receivers Leaderboard ──────────────────────────────────────────
 
 export function queryTopReceivers(
