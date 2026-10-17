@@ -1,6 +1,7 @@
 "use client";
 import { NETWORK } from "@/lib/stellar";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import WalletButton from "./WalletButton";
 import CommandPalette from "./CommandPalette";
@@ -87,6 +88,7 @@ function MonitorIcon() {
 }
 
 export default function Navbar() {
+  const pathname = usePathname();
   const [theme, setTheme] = useState<"light" | "dark" | "system">("system");
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -207,7 +209,12 @@ export default function Navbar() {
           <Link href="/lists" className="hover:text-white transition-colors">
             Lists
           </Link>
-          <Link href="/leaderboard" className="hover:text-white transition-colors">
+          <Link
+            href="/leaderboard"
+            className={`hover:text-white transition-colors ${
+              pathname === "/leaderboard" ? "text-white font-medium" : ""
+            }`}
+          >
             Leaderboard
           </Link>
           <Link
