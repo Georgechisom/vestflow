@@ -3523,3 +3523,268 @@ export function queryTopSenders(
   return list.slice(0, cappedLimit);
 }
 
+
+// ── Active Streams by Token (#1062) ───────────────────────────────────
+
+export interface ActiveStreamByTokenRow {
+  id: string;
+  sender: string;
+  receiver: string;
+  rate_per_second: string;
+  start_time: number;
+  estimated_end_time: number | null;
+}
+
+export function queryActiveStreamsByToken(params: {
+  token: string;
+  limit: number;
+  cursor?: string;
+  network?: NetworkName;
+}): { items: ActiveStreamByTokenRow[]; nextCursor: string | null } {
+  const db = getDb(params.network);
+  const now = Math.floor(Date.now() / 1000);
+  const limit = Math.max(1, Math.min(params.limit, 100));
+
+  let cursorRate: string | null = null;
+  let cursorId: string | null = null;
+
+  if (params.cursor) {
+    try {
+      const decoded = Buffer.from(params.cursor, "base64url").toString("utf8");
+      const parts = decoded.split(":");
+      if (parts.length === 2) {
+        [cursorRate, cursorId] = parts;
+      } else {
+        return { items: [], nextCursor: null };
+      }
+    } catch {
+      return { items: [], nextCursor: null };
+    }
+  }
+
+  let sql: string;
+  let bindings: (string | number)[];
+
+  if (cursorRate && cursorId) {
+    sql = `
+      SELECT id, account AS sender, receiver, rate_per_second,
+             created_at AS start_time, estimated_end_time
+      FROM drips_streams
+      WHERE token = ?
+        AND ended_at IS NULL
+        AND (estimated_end_time IS NULL OR estimated_end_time > ?)
+        AND (
+          CAST(rate_per_second AS INTEGER) < CAST(? AS INTEGER)
+          OR (rate_per_second = ? AND id > ?)
+        )
+      ORDER BY CAST(rate_per_second AS INTEGER) DESC, id ASC
+      LIMIT ?`;
+    bindings = [params.token, now, cursorRate, cursorRate, cursorId, limit + 1];
+  } else {
+    sql = `
+      SELECT id, account AS sender, receiver, rate_per_second,
+             created_at AS start_time, estimated_end_time
+      FROM drips_streams
+      WHERE token = ?
+        AND ended_at IS NULL
+        AND (estimated_end_time IS NULL OR estimated_end_time > ?)
+      ORDER BY CAST(rate_per_second AS INTEGER) DESC, id ASC
+      LIMIT ?`;
+    bindings = [params.token, now, limit + 1];
+  }
+
+  const rows = db.prepare(sql).all(...bindings) as ActiveStreamByTokenRow[];
+
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit);
+
+  const last = page[page.length - 1];
+  const nextCursor =
+    hasMore && last
+      ? Buffer.from(`${last.rate_per_second}:${last.id}`).toString("base64url")
+      : null;
+
+  return { items: page, nextCursor };
+}
+
+// ── Closed Streams by Sender (#1064) ──────────────────────────────────
+
+export interface ClosedStreamRow {
+  receiver: string;
+  token: string;
+  close_time: number;
+  total_streamed: string;
+}
+
+export function queryClosedStreamsBySender(params: {
+  sender: string;
+  limit: number;
+  cursor?: string;
+  network?: NetworkName;
+}): { items: ClosedStreamRow[]; nextCursor: string | null } | null {
+  const db = getDb(params.network);
+  const limit = Math.max(1, Math.min(params.limit, 100));
+
+  let cursorTime: number | null = null;
+  let cursorId: string | null = null;
+
+  if (params.cursor) {
+    try {
+      const decoded = Buffer.from(params.cursor, "base64url").toString("utf8");
+      const parts = decoded.split(":");
+      if (parts.length === 2) {
+        cursorTime = Number(parts[0]);
+        cursorId = parts[1];
+        if (!Number.isFinite(cursorTime)) return null;
+      } else {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  // Closed streams: ended_at IS NOT NULL, meaning they were explicitly closed
+  // (rate set to 0). total_streamed is approximated from the stream_history
+  // records as: rate * (ended_at - open_time).
+  let sql: string;
+  let bindings: (string | number)[];
+
+  if (cursorTime !== null && cursorId !== null) {
+    sql = `
+      SELECT ds.receiver, ds.token,
+             ds.ended_at AS close_time,
+             CAST(
+               (SELECT COALESCE(SUM(
+                 CAST(sh.old_rate AS INTEGER) *
+                 (COALESCE(
+                    LEAD(sh.timestamp) OVER (PARTITION BY sh.sender, sh.receiver, sh.token ORDER BY sh.timestamp),
+                    ds.ended_at
+                  ) - sh.timestamp)
+               ), 0)
+               FROM stream_history sh
+               WHERE sh.sender = ds.account AND sh.receiver = ds.receiver AND sh.token = ds.token
+                 AND sh.old_rate != '0'
+               ) AS TEXT
+             ) AS total_streamed
+      FROM drips_streams ds
+      WHERE ds.account = ?
+        AND ds.ended_at IS NOT NULL
+        AND (ds.ended_at < ? OR (ds.ended_at = ? AND ds.id > ?))
+      ORDER BY ds.ended_at DESC, ds.id ASC
+      LIMIT ?`;
+    bindings = [params.sender, cursorTime, cursorTime, cursorId, limit + 1];
+  } else {
+    sql = `
+      SELECT ds.receiver, ds.token,
+             ds.ended_at AS close_time,
+             CAST(
+               (SELECT COALESCE(SUM(
+                 CAST(sh.old_rate AS INTEGER) *
+                 (COALESCE(
+                    LEAD(sh.timestamp) OVER (PARTITION BY sh.sender, sh.receiver, sh.token ORDER BY sh.timestamp),
+                    ds.ended_at
+                  ) - sh.timestamp)
+               ), 0)
+               FROM stream_history sh
+               WHERE sh.sender = ds.account AND sh.receiver = ds.receiver AND sh.token = ds.token
+                 AND sh.old_rate != '0'
+               ) AS TEXT
+             ) AS total_streamed
+      FROM drips_streams ds
+      WHERE ds.account = ?
+        AND ds.ended_at IS NOT NULL
+      ORDER BY ds.ended_at DESC, ds.id ASC
+      LIMIT ?`;
+    bindings = [params.sender, limit + 1];
+  }
+
+  const rows = db.prepare(sql).all(...bindings) as ClosedStreamRow[];
+
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit);
+
+  const last = page[page.length - 1];
+  const nextCursor =
+    hasMore && last
+      ? Buffer.from(`${last.close_time}:${(last as any).id ?? ""}`).toString("base64url")
+      : null;
+
+  return { items: page, nextCursor };
+}
+
+// ── Top Givers Leaderboard (#1063) ────────────────────────────────────
+
+export interface TopGiverRow {
+  account: string;
+  total_given: string;
+  give_count: number;
+}
+
+export function queryTopGivers(
+  token: string,
+  limit: number = 20,
+  network?: NetworkName,
+): TopGiverRow[] {
+  const cappedLimit = Math.max(1, Math.min(limit, 50));
+  const db = getDb(network);
+
+  const rows = db
+    .prepare(
+      `SELECT sender AS account,
+              CAST(SUM(CAST(amount_stroops AS INTEGER)) AS TEXT) AS total_given,
+              COUNT(*) AS give_count
+       FROM gives
+       WHERE token = ?
+       GROUP BY sender
+       ORDER BY SUM(CAST(amount_stroops AS INTEGER)) DESC
+       LIMIT ?`,
+    )
+    .all(token, cappedLimit) as TopGiverRow[];
+
+  return rows;
+}
+
+// ── Drips-Lists Ecosystem Stats (#1065) ──────────────────────────────
+
+export interface DripsListsStats {
+  total_lists: number;
+  active_lists: number;
+  frozen_lists: number;
+  total_members: number;
+  total_funded_lists: number;
+}
+
+export function queryDripsListsStats(network?: NetworkName): DripsListsStats {
+  const db = getDb(network);
+
+  const totalsRow = db
+    .prepare(
+      `SELECT
+         COUNT(*) AS total_lists,
+         SUM(CASE WHEN CAST(total_funding_rate_per_sec AS INTEGER) > 0 THEN 1 ELSE 0 END) AS active_lists,
+         SUM(CASE WHEN CAST(total_funding_rate_per_sec AS INTEGER) = 0 THEN 1 ELSE 0 END) AS frozen_lists,
+         SUM(CASE WHEN CAST(target_rate_per_sec AS INTEGER) > 0 THEN 1 ELSE 0 END) AS total_funded_lists
+       FROM drips_lists`,
+    )
+    .get() as {
+      total_lists: number;
+      active_lists: number;
+      frozen_lists: number;
+      total_funded_lists: number;
+    } | undefined;
+
+  const membersRow = db
+    .prepare(
+      `SELECT COUNT(*) AS total_members FROM drips_list_members WHERE left_at IS NULL`,
+    )
+    .get() as { total_members: number } | undefined;
+
+  return {
+    total_lists: totalsRow?.total_lists ?? 0,
+    active_lists: totalsRow?.active_lists ?? 0,
+    frozen_lists: totalsRow?.frozen_lists ?? 0,
+    total_members: membersRow?.total_members ?? 0,
+    total_funded_lists: totalsRow?.total_funded_lists ?? 0,
+  };
+}
