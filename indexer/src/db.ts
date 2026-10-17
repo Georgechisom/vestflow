@@ -3957,3 +3957,455 @@ export function getSplitsDistribution(network?: NetworkName): SplitsDistribution
     account_count: counts.get(bucket) ?? 0,
   }));
 }
+
+// ── Active Streams by Token (#1062) ──────────────────────────────────
+
+export interface ActiveStreamByTokenRow {
+  id: string;
+  sender: string;
+  receiver: string;
+  rate_per_second: string;
+  start_time: number;
+  estimated_end_time: number | null;
+}
+
+export function queryActiveStreamsByToken(params: {
+  token: string;
+  limit: number;
+  cursor?: string;
+  network?: NetworkName;
+}): { items: ActiveStreamByTokenRow[]; nextCursor: string | null } {
+  const db = getDb(params.network);
+  const now = Math.floor(Date.now() / 1000);
+  const limit = Math.max(1, Math.min(params.limit, 100));
+
+  let cursorRate: string | null = null;
+  let cursorId: string | null = null;
+
+  if (params.cursor) {
+    try {
+      const decoded = Buffer.from(params.cursor, "base64url").toString("utf8");
+      const parts = decoded.split(":");
+      if (parts.length === 2) {
+        [cursorRate, cursorId] = parts;
+      } else {
+        return { items: [], nextCursor: null };
+      }
+    } catch {
+      return { items: [], nextCursor: null };
+    }
+  }
+
+  let sql: string;
+  let bindings: (string | number)[];
+
+  if (cursorRate && cursorId) {
+    sql = `
+      SELECT id, account AS sender, receiver, rate_per_second,
+             created_at AS start_time, estimated_end_time
+      FROM drips_streams
+      WHERE token = ?
+        AND ended_at IS NULL
+        AND (estimated_end_time IS NULL OR estimated_end_time > ?)
+        AND (
+          CAST(rate_per_second AS INTEGER) < CAST(? AS INTEGER)
+          OR (rate_per_second = ? AND id > ?)
+        )
+      ORDER BY CAST(rate_per_second AS INTEGER) DESC, id ASC
+      LIMIT ?`;
+    bindings = [params.token, now, cursorRate, cursorRate, cursorId, limit + 1];
+  } else {
+    sql = `
+      SELECT id, account AS sender, receiver, rate_per_second,
+             created_at AS start_time, estimated_end_time
+      FROM drips_streams
+      WHERE token = ?
+        AND ended_at IS NULL
+        AND (estimated_end_time IS NULL OR estimated_end_time > ?)
+      ORDER BY CAST(rate_per_second AS INTEGER) DESC, id ASC
+      LIMIT ?`;
+    bindings = [params.token, now, limit + 1];
+  }
+
+  const rows = db.prepare(sql).all(...bindings) as ActiveStreamByTokenRow[];
+
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit);
+
+  const last = page[page.length - 1];
+  const nextCursor =
+    hasMore && last
+      ? Buffer.from(`${last.rate_per_second}:${last.id}`).toString("base64url")
+      : null;
+
+  return { items: page, nextCursor };
+}
+
+// ── Closed Streams by Sender (#1064) ──────────────────────────────────
+
+export interface ClosedStreamRow {
+  receiver: string;
+  token: string;
+  close_time: number;
+  total_streamed: string;
+}
+
+export function queryClosedStreamsBySender(params: {
+  sender: string;
+  limit: number;
+  cursor?: string;
+  network?: NetworkName;
+}): { items: ClosedStreamRow[]; nextCursor: string | null } | null {
+  const db = getDb(params.network);
+  const limit = Math.max(1, Math.min(params.limit, 100));
+
+  let cursorTime: number | null = null;
+  let cursorId: string | null = null;
+
+  if (params.cursor) {
+    try {
+      const decoded = Buffer.from(params.cursor, "base64url").toString("utf8");
+      const parts = decoded.split(":");
+      if (parts.length === 2) {
+        cursorTime = Number(parts[0]);
+        cursorId = parts[1];
+        if (!Number.isFinite(cursorTime)) return null;
+      } else {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  let sql: string;
+  let bindings: (string | number)[];
+
+  if (cursorTime !== null && cursorId !== null) {
+    sql = `
+      SELECT ds.receiver, ds.token,
+             ds.ended_at AS close_time,
+             CAST(
+               (SELECT COALESCE(SUM(
+                 CAST(sh.old_rate AS INTEGER) *
+                 (COALESCE(
+                    LEAD(sh.timestamp) OVER (PARTITION BY sh.sender, sh.receiver, sh.token ORDER BY sh.timestamp),
+                    ds.ended_at
+                  ) - sh.timestamp)
+               ), 0)
+               FROM stream_history sh
+               WHERE sh.sender = ds.account AND sh.receiver = ds.receiver AND sh.token = ds.token
+                 AND sh.old_rate != '0'
+               ) AS TEXT
+             ) AS total_streamed
+      FROM drips_streams ds
+      WHERE ds.account = ?
+        AND ds.ended_at IS NOT NULL
+        AND (ds.ended_at < ? OR (ds.ended_at = ? AND ds.id > ?))
+      ORDER BY ds.ended_at DESC, ds.id ASC
+      LIMIT ?`;
+    bindings = [params.sender, cursorTime, cursorTime, cursorId, limit + 1];
+  } else {
+    sql = `
+      SELECT ds.receiver, ds.token,
+             ds.ended_at AS close_time,
+             CAST(
+               (SELECT COALESCE(SUM(
+                 CAST(sh.old_rate AS INTEGER) *
+                 (COALESCE(
+                    LEAD(sh.timestamp) OVER (PARTITION BY sh.sender, sh.receiver, sh.token ORDER BY sh.timestamp),
+                    ds.ended_at
+                  ) - sh.timestamp)
+               ), 0)
+               FROM stream_history sh
+               WHERE sh.sender = ds.account AND sh.receiver = ds.receiver AND sh.token = ds.token
+                 AND sh.old_rate != '0'
+               ) AS TEXT
+             ) AS total_streamed
+      FROM drips_streams ds
+      WHERE ds.account = ?
+        AND ds.ended_at IS NOT NULL
+      ORDER BY ds.ended_at DESC, ds.id ASC
+      LIMIT ?`;
+    bindings = [params.sender, limit + 1];
+  }
+
+  const rows = db.prepare(sql).all(...bindings) as ClosedStreamRow[];
+
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit);
+
+  const last = page[page.length - 1];
+  const nextCursor =
+    hasMore && last
+      ? Buffer.from(`${last.close_time}:${(last as any).id ?? ""}`).toString("base64url")
+      : null;
+
+  return { items: page, nextCursor };
+}
+
+// ── Top Givers Leaderboard (#1063) ────────────────────────────────────
+
+export interface TopGiverRow {
+  account: string;
+  total_given: string;
+  give_count: number;
+}
+
+export function queryTopGivers(
+  token: string,
+  limit: number = 20,
+  network?: NetworkName,
+): TopGiverRow[] {
+  const cappedLimit = Math.max(1, Math.min(limit, 50));
+  const db = getDb(network);
+
+  const rows = db
+    .prepare(
+      `SELECT sender AS account,
+              CAST(SUM(CAST(amount_stroops AS INTEGER)) AS TEXT) AS total_given,
+              COUNT(*) AS give_count
+       FROM gives
+       WHERE token = ?
+       GROUP BY sender
+       ORDER BY SUM(CAST(amount_stroops AS INTEGER)) DESC
+       LIMIT ?`,
+    )
+    .all(token, cappedLimit) as TopGiverRow[];
+
+  return rows;
+}
+
+// ── Drips-Lists Ecosystem Stats (#1065) ──────────────────────────────
+
+export interface DripsListsStats {
+  total_lists: number;
+  active_lists: number;
+  frozen_lists: number;
+  total_members: number;
+  total_funded_lists: number;
+}
+
+export function queryDripsListsStats(network?: NetworkName): DripsListsStats {
+  const db = getDb(network);
+
+  const totalsRow = db
+    .prepare(
+      `SELECT
+         COUNT(*) AS total_lists,
+         SUM(CASE WHEN CAST(total_funding_rate_per_sec AS INTEGER) > 0 THEN 1 ELSE 0 END) AS active_lists,
+         SUM(CASE WHEN CAST(total_funding_rate_per_sec AS INTEGER) = 0 THEN 1 ELSE 0 END) AS frozen_lists,
+         SUM(CASE WHEN CAST(target_rate_per_sec AS INTEGER) > 0 THEN 1 ELSE 0 END) AS total_funded_lists
+       FROM drips_lists`,
+    )
+    .get() as {
+      total_lists: number;
+      active_lists: number;
+      frozen_lists: number;
+      total_funded_lists: number;
+    } | undefined;
+
+  const membersRow = db
+    .prepare(
+      `SELECT COUNT(*) AS total_members FROM drips_list_members WHERE left_at IS NULL`,
+    )
+    .get() as { total_members: number } | undefined;
+
+  return {
+    total_lists: totalsRow?.total_lists ?? 0,
+    active_lists: totalsRow?.active_lists ?? 0,
+    frozen_lists: totalsRow?.frozen_lists ?? 0,
+    total_members: membersRow?.total_members ?? 0,
+    total_funded_lists: totalsRow?.total_funded_lists ?? 0,
+  };
+}
+
+// ── Batch Give Summaries (#1067) ──────────────────────────────────────
+
+export interface BatchGiveSummaryRow {
+  account: string;
+  sent_count: number;
+  received_count: number;
+  total_sent: string;
+  total_received: string;
+}
+
+export function getBatchGiveSummaries(
+  accounts: string[],
+  network?: NetworkName,
+): BatchGiveSummaryRow[] {
+  if (!accounts || accounts.length === 0) return [];
+  const db = getDb(network);
+
+  // Maximum 50 accounts enforced
+  const safeAccounts = accounts.slice(0, 50);
+
+  // Run in a single DB query using target accounts table and left joins
+  const valuesClause = safeAccounts.map(() => "(?)").join(", ");
+  const inClause = safeAccounts.map(() => "?").join(", ");
+
+  const sql = `
+    WITH target_accounts(account) AS (
+      VALUES ${valuesClause}
+    )
+    SELECT
+      t.account,
+      COALESCE(s.sent_count, 0) AS sent_count,
+      COALESCE(s.total_sent, '0') AS total_sent,
+      COALESCE(r.received_count, 0) AS received_count,
+      COALESCE(r.total_received, '0') AS total_received
+    FROM target_accounts t
+    LEFT JOIN (
+      SELECT sender, COUNT(*) AS sent_count, CAST(SUM(CAST(amount_stroops AS INTEGER)) AS TEXT) AS total_sent
+      FROM gives
+      WHERE sender IN (${inClause})
+      GROUP BY sender
+    ) s ON t.account = s.sender
+    LEFT JOIN (
+      SELECT receiver, COUNT(*) AS received_count, CAST(SUM(CAST(amount_stroops AS INTEGER)) AS TEXT) AS total_received
+      FROM gives
+      WHERE receiver IN (${inClause})
+      GROUP BY receiver
+    ) r ON t.account = r.receiver
+  `;
+
+  const params = [...safeAccounts, ...safeAccounts, ...safeAccounts];
+  const rows = db.prepare(sql).all(...params) as Array<{
+    account: string;
+    sent_count: number;
+    received_count: number;
+    total_sent: string | null;
+    total_received: string | null;
+  }>;
+
+  return rows.map((r) => ({
+    account: r.account,
+    sent_count: Number(r.sent_count ?? 0),
+    received_count: Number(r.received_count ?? 0),
+    total_sent: String(r.total_sent ?? "0"),
+    total_received: String(r.total_received ?? "0"),
+  }));
+}
+
+// ── Unified Search (#1066) ──────────────────────────────────────────
+
+export interface UnifiedSearchResults {
+  wallets: Array<{ type: "wallet"; address: string }>;
+  lists: Array<{ type: "list"; id: string; name: string; owner: string; token: string }>;
+  txs: Array<{ type: "tx"; hash: string; id: string; ledger: number }>;
+  results: Array<
+    | { type: "wallet"; address: string }
+    | { type: "list"; id: string; name: string; owner: string; token: string }
+    | { type: "tx"; hash: string; id: string; ledger: number }
+  >;
+}
+
+export function unifiedSearch(
+  query: string,
+  network?: NetworkName,
+): UnifiedSearchResults {
+  const q = query.trim();
+  if (!q) {
+    return { wallets: [], lists: [], txs: [], results: [] };
+  }
+
+  const db = getDb(network);
+
+  // 1. Wallets (address match, limit 5)
+  const walletRows = db.prepare(`
+    SELECT DISTINCT address FROM (
+      SELECT sender AS address FROM gives WHERE sender LIKE ?
+      UNION
+      SELECT receiver AS address FROM gives WHERE receiver LIKE ?
+      UNION
+      SELECT account AS address FROM drips_streams WHERE account LIKE ?
+      UNION
+      SELECT receiver AS address FROM drips_streams WHERE receiver LIKE ?
+      UNION
+      SELECT grantor AS address FROM schedule_events WHERE grantor LIKE ?
+      UNION
+      SELECT beneficiary AS address FROM schedule_events WHERE beneficiary LIKE ?
+      UNION
+      SELECT owner AS address FROM drips_lists WHERE owner LIKE ?
+    )
+    LIMIT 5
+  `).all(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`) as { address: string }[];
+
+  const wallets = walletRows.map((r) => ({
+    type: "wallet" as const,
+    address: r.address,
+  }));
+
+  // If query is an exact Stellar address not in DB yet, prepend it up to 5
+  const STELLAR_ADDRESS_RE = /^G[A-Z2-7]{55}$/;
+  if (STELLAR_ADDRESS_RE.test(q) && !wallets.some((w) => w.address === q)) {
+    wallets.unshift({ type: "wallet" as const, address: q });
+    if (wallets.length > 5) wallets.pop();
+  }
+
+  // 2. Drips Lists (name match, limit 5)
+  const listRows = db.prepare(`
+    SELECT id, name, owner, token
+    FROM drips_lists
+    WHERE name LIKE ?
+    ORDER BY
+      CASE
+        WHEN LOWER(name) = LOWER(?) THEN 0
+        WHEN LOWER(name) LIKE LOWER(?) || '%' THEN 1
+        ELSE 2
+      END,
+      created_at DESC
+    LIMIT 5
+  `).all(`%${q}%`, q, q) as Array<{ id: string; name: string; owner: string; token: string }>;
+
+  const lists = listRows.map((r) => ({
+    type: "list" as const,
+    id: r.id,
+    name: r.name,
+    owner: r.owner,
+    token: r.token,
+  }));
+
+  // 3. Transactions (hash prefix match, limit 5)
+  let txRows: Array<{ id: string; ledger: number; hash: string }> = [];
+  try {
+    const hasTxHash = (db.prepare(`PRAGMA table_info(schedule_events)`).all() as { name: string }[]).some(
+      (c) => c.name === "transaction_hash",
+    );
+
+    if (hasTxHash) {
+      txRows = db.prepare(`
+        SELECT DISTINCT id, ledger, transaction_hash AS hash
+        FROM schedule_events
+        WHERE transaction_hash LIKE ? OR id LIKE ?
+        LIMIT 5
+      `).all(`${q}%`, `${q}%`) as Array<{ id: string; ledger: number; hash: string }>;
+    } else {
+      txRows = db.prepare(`
+        SELECT DISTINCT id, ledger, id AS hash
+        FROM (
+          SELECT id, ledger FROM schedule_events WHERE id LIKE ?
+          UNION
+          SELECT id, ledger FROM gives WHERE id LIKE ?
+        )
+        LIMIT 5
+      `).all(`${q}%`, `${q}%`) as Array<{ id: string; ledger: number; hash: string }>;
+    }
+  } catch {
+    txRows = [];
+  }
+
+  const txs = txRows.map((r) => ({
+    type: "tx" as const,
+    hash: r.hash || r.id,
+    id: r.id,
+    ledger: r.ledger,
+  }));
+
+  return {
+    wallets,
+    lists,
+    txs,
+    results: [...wallets, ...lists, ...txs],
+  };
+}

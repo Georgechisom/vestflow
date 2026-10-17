@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyJWT } from "@/lib/jwt";
+import { isRateLimitExempt, checkGlobalRateLimit } from "@/lib/rateLimit";
 
 const REQUEST_START_HEADER = "x-request-start";
 const REQUEST_ID_HEADER = "x-request-id";
@@ -89,12 +90,20 @@ function getApiVersionInfo(pathname: string): {
 export function middleware(request: NextRequest) {
   let { pathname } = request.nextUrl;
 
-  if (!pathname.startsWith("/api/")) {
-    return NextResponse.next();
-  }
-
   if (request.method === "OPTIONS") {
     return applyCorsHeaders(new NextResponse(null, { status: 204 }), request);
+  }
+
+  // Exempt endpoints like /health and /metrics bypass rate limiting
+  if (!isRateLimitExempt(pathname)) {
+    const rateLimitResponse = checkGlobalRateLimit(request);
+    if (rateLimitResponse) {
+      return applyCorsHeaders(rateLimitResponse, request);
+    }
+  }
+
+  if (!pathname.startsWith("/api/")) {
+    return NextResponse.next();
   }
 
   const { pathname: versionedPath, version, isDeprecated } = getApiVersionInfo(
@@ -175,5 +184,5 @@ export function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/api/:path*", "/api/v1/:path*"],
+  matcher: ["/api/:path*", "/api/v1/:path*", "/health", "/metrics"],
 };
